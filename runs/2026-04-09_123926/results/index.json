@@ -1,0 +1,31 @@
+{
+  "baseline_csp": {
+    "outputs": {
+      "within_loso": "runs/2026-04-09_123926/results/real_baseline_a_csp_lda.json"
+    }
+  },
+  "baseline_riemann": {
+    "outputs": {
+      "within_loso": "runs/2026-04-09_123926/results/real_baseline_b_riemannian.json"
+    }
+  },
+  "vit_baseline": {
+    "outputs": {
+      "within_subject": "runs/2026-04-09_123926/results/real_baseline_c_vit.json",
+      "loso": "runs/2026-04-09_123926/results/real_baseline_c_vit_loso.json"
+    }
+  },
+  "dual_branch": {
+    "outputs": {
+      "attention_within_subject": "runs/2026-04-09_123926/results/real_dual_branch_attention_vit.json",
+      "attention_loso": "runs/2026-04-09_123926/results/real_dual_branch_attention_vit_loso.json",
+      "gated_within_subject": "runs/2026-04-09_123926/results/real_dual_branch_gated_vit.json",
+      "gated_loso": "runs/2026-04-09_123926/results/real_dual_branch_gated_vit_loso.json"
+    }
+  },
+  "reduced_data": {
+    "outputs": {
+      "reduced_data": "runs/2026-04-09_123926/results/real_reduced_data_results_vit.json"
+    }
+  }
+}

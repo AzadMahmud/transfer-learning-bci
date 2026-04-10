@@ -1,0 +1,608 @@
+"""PyTorch training loop for MI-EEG classifiers.
+
+Provides a generic Trainer class with:
+    - Training + validation loop with early stopping
+    - AdamW optimizer with cosine LR schedule and linear warmup
+    - Label smoothing cross-entropy loss
+    - Best-model checkpointing
+    - Per-epoch metric logging
+
+Used by Baseline C (ViT standalone) and the full dual-branch model (Phase 2).
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+import typing
+from typing import Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.metrics import accuracy_score, cohen_kappa_score
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader, Dataset, random_split
+
+logger = logging.getLogger(__name__)
+
+MixupLabels = tuple[torch.Tensor, torch.Tensor, float]
+
+
+def _dataset_len(dataset: Dataset) -> int:
+    return len(dataset)  # type: ignore[arg-type, call-overload]
+
+
+# ---------------------------------------------------------------------------
+# Training result container
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EpochResult:
+    epoch: int
+    train_loss: float
+    val_loss: float
+    val_accuracy: float
+    val_kappa: float
+    lr: float
+
+
+@dataclass
+class TrainResult:
+    """Outcome of a full training run."""
+
+    best_val_accuracy: float
+    best_epoch: int
+    final_epoch: int
+    max_epochs: int
+    history: list[EpochResult] = field(repr=False)
+    best_checkpoint_path: str | None = None
+
+    @property
+    def stopped_early(self) -> bool:
+        """True if training stopped before reaching max_epochs."""
+        return self.final_epoch < self.max_epochs
+
+
+# ---------------------------------------------------------------------------
+# Learning-rate schedule helpers
+# ---------------------------------------------------------------------------
+
+
+def _cosine_with_warmup_schedule(
+    optimizer: torch.optim.Optimizer,
+    warmup_epochs: int,
+    total_epochs: int,
+) -> LambdaLR:
+    """Linear warmup then cosine annealing LR schedule."""
+
+    def lr_lambda(epoch: int) -> float:
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / max(warmup_epochs, 1)
+        progress = float(epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return LambdaLR(optimizer, lr_lambda)
+
+
+# ---------------------------------------------------------------------------
+# Core Trainer class
+# ---------------------------------------------------------------------------
+
+
+class Trainer:
+    """Generic PyTorch trainer.
+
+    Args:
+        model: nn.Module to train.
+        device: Torch device string.
+        learning_rate: Peak learning rate.
+        weight_decay: L2 regularization.
+        epochs: Maximum number of epochs.
+        batch_size: Training batch size.
+        warmup_epochs: Epochs for linear LR warmup.
+        patience: Early-stopping patience (epochs without improvement).
+        min_delta: Minimum improvement to reset patience counter.
+        label_smoothing: Label smoothing for CrossEntropyLoss.
+        val_fraction: Fraction of training data to use for validation.
+        checkpoint_dir: Where to save the best model checkpoint.
+        seed: Random seed for the train/val split.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        device: str | torch.device = "cpu",
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-4,
+        epochs: int = 100,
+        batch_size: int = 32,
+        warmup_epochs: int = 5,
+        patience: int = 15,
+        min_delta: float = 1e-4,
+        label_smoothing: float = 0.1,
+        val_fraction: float = 0.2,
+        checkpoint_dir: str | Path | None = None,
+        seed: int = 42,
+        num_workers: int = 0,
+        prefetch_factor: int | None = None,
+        persistent_workers: bool = False,
+        use_amp: bool = False,
+        compile_model: bool = False,
+        gradient_accumulation_steps: int = 1,
+        backbone_lr_scale: float | None = None,
+        layer_lr_decay: float | None = None,
+    ) -> None:
+        self.model: nn.Module = model
+        self.device = torch.device(device)
+        self.lr = learning_rate
+        self.weight_decay = weight_decay
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.warmup_epochs = warmup_epochs
+        self.patience = patience
+        self.min_delta = min_delta
+        self.label_smoothing = label_smoothing
+        self.val_fraction = val_fraction
+        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+        self.seed = seed
+        self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
+        self.persistent_workers = persistent_workers
+        self.use_amp = use_amp and self.device.type == "cuda"
+        self.compile_model = compile_model
+        self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
+        self.backbone_lr_scale = backbone_lr_scale
+        self.layer_lr_decay = layer_lr_decay
+        if self.compile_model and hasattr(torch, "compile"):
+            compiled_model = torch.compile(self.model)
+            self.model = typing.cast(nn.Module, compiled_model)
+        self.model.to(self.device)
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        if self.use_amp:
+            self.scaler: Optional[torch.cuda.amp.GradScaler] = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
+
+    def _compute_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor | MixupLabels,
+    ) -> torch.Tensor:
+        if isinstance(labels, tuple):
+            y_a, y_b, lam = labels
+            return lam * self.criterion(logits, y_a) + (1.0 - lam) * self.criterion(logits, y_b)
+        return self.criterion(logits, labels)
+
+    def _make_optimizer_and_scheduler(self, total_epochs: int):
+        # --- Layer-wise LR decay (finest granularity) -----------------------
+        if self.layer_lr_decay is not None and hasattr(self.model, "get_layerwise_param_groups"):
+            param_groups = self._build_layerwise_param_groups(self.lr, self.layer_lr_decay)
+        # --- Two-group differential LR (backbone vs rest) -------------------
+        elif self.backbone_lr_scale is not None and (
+            hasattr(self.model, "vit_branch") or hasattr(self.model, "get_backbone_params")
+        ):
+            if hasattr(self.model, "vit_branch"):
+                vit_branch = self.model.vit_branch  # type: ignore[attr-defined]
+            else:
+                vit_branch = self.model
+            backbone_param_ids = {id(p) for p in vit_branch.get_backbone_params()}
+            backbone_params = [
+                p
+                for p in self.model.parameters()
+                if id(p) in backbone_param_ids and p.requires_grad
+            ]
+            other_params = [
+                p
+                for p in self.model.parameters()
+                if id(p) not in backbone_param_ids and p.requires_grad
+            ]
+            param_groups = [
+                {"params": backbone_params, "lr": self.lr * self.backbone_lr_scale},
+                {"params": other_params, "lr": self.lr},
+            ]
+            logger.info(
+                "Differential LR: backbone=%.2e, rest=%.2e",
+                self.lr * self.backbone_lr_scale,
+                self.lr,
+            )
+        # --- Uniform LR (default) ------------------------------------------
+        else:
+            param_groups = [{"params": list(self.model.parameters()), "lr": self.lr}]
+
+        optimizer = AdamW(
+            param_groups,
+            weight_decay=self.weight_decay,
+        )
+        scheduler = _cosine_with_warmup_schedule(optimizer, self.warmup_epochs, total_epochs)
+        return optimizer, scheduler
+
+    def _build_layerwise_param_groups(
+        self,
+        base_lr: float,
+        decay: float,
+    ) -> list[dict]:
+        """Create per-layer parameter groups with exponential LR decay.
+
+        Earlier (shallower) layers receive a lower learning rate::
+
+            lr_i = base_lr * decay^(N - 1 - i)
+
+        where *i* is the layer index (0 = shallowest) and *N* is the total
+        number of groups.  The deepest group (head) always gets ``base_lr``.
+        """
+        layer_groups = self.model.get_layerwise_param_groups()  # type: ignore[attr-defined]
+        n_groups = len(layer_groups)
+        param_groups: list[dict] = []
+
+        for i, (name, params) in enumerate(layer_groups):
+            trainable = [p for p in params if p.requires_grad]
+            if not trainable:
+                continue
+            group_lr = base_lr * (decay ** (n_groups - 1 - i))
+            param_groups.append({"params": trainable, "lr": group_lr})
+            logger.debug(
+                "  layer-wise LR: %-15s  lr=%.2e  (%d params)", name, group_lr, len(trainable)
+            )
+
+        logger.info(
+            "Layer-wise LR decay=%.2f: %d groups, lr range [%.2e .. %.2e]",
+            decay,
+            len(param_groups),
+            param_groups[0]["lr"] if param_groups else 0.0,
+            param_groups[-1]["lr"] if param_groups else 0.0,
+        )
+        return param_groups
+
+    def _split_dataset(self, dataset: Dataset) -> tuple[DataLoader, DataLoader]:
+        """Split dataset into train and validation DataLoaders."""
+        n = _dataset_len(dataset)
+        n_val = max(1, int(n * self.val_fraction))
+        n_train = n - n_val
+        generator = torch.Generator().manual_seed(self.seed)
+        train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=generator)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=n_train > self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.device.type == "cuda",
+            persistent_workers=self.persistent_workers if self.num_workers > 0 else False,
+            prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=self.batch_size * 2,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=self.device.type == "cuda",
+            persistent_workers=self.persistent_workers if self.num_workers > 0 else False,
+            prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
+        )
+        return train_loader, val_loader
+
+    def _train_one_epoch(
+        self,
+        loader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        forward_fn: Callable,
+    ) -> float:
+        """Run one training epoch and return mean loss."""
+        self.model.train()
+        total_loss = 0.0
+        n = 0
+        n_batches = len(loader)
+        log_every = max(1, n_batches // 5)
+        t_epoch = time.time()
+        optimizer.zero_grad(set_to_none=True)
+        last_batch_idx = 0
+        for batch_idx, batch in enumerate(loader, start=1):
+            last_batch_idx = batch_idx
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    logits, labels = forward_fn(batch)
+                    loss = self._compute_loss(logits, labels)
+                unscaled_loss = loss
+                loss = loss / self.gradient_accumulation_steps
+                assert self.scaler is not None
+                self.scaler.scale(loss).backward()
+            else:
+                logits, labels = forward_fn(batch)
+                loss = self._compute_loss(logits, labels)
+                unscaled_loss = loss
+                loss = loss / self.gradient_accumulation_steps
+                loss.backward()
+
+            if batch_idx % self.gradient_accumulation_steps == 0:
+                if self.use_amp:
+                    assert self.scaler is not None
+                    self.scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                if self.use_amp:
+                    assert self.scaler is not None
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            batch_size = logits.shape[0]
+            total_loss += unscaled_loss.item() * batch_size
+            n += batch_size
+
+            if batch_idx == 1 or batch_idx % log_every == 0 or batch_idx == n_batches:
+                logger.info(
+                    "    batch %d/%d  loss=%.4f  (%.1fs elapsed)",
+                    batch_idx,
+                    n_batches,
+                    unscaled_loss.item(),
+                    time.time() - t_epoch,
+                )
+        if last_batch_idx and last_batch_idx % self.gradient_accumulation_steps != 0:
+            if self.use_amp:
+                assert self.scaler is not None
+                self.scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            if self.use_amp:
+                assert self.scaler is not None
+                self.scaler.step(optimizer)
+                self.scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        return total_loss / max(n, 1)
+
+    @torch.inference_mode()
+    def _evaluate(
+        self,
+        loader: DataLoader,
+        forward_fn: Callable,
+    ) -> tuple[float, float, float]:
+        """Evaluate model on a DataLoader.
+
+        Returns:
+            (loss, accuracy_percent, kappa)
+        """
+        self.model.eval()
+        total_loss = 0.0
+        n = 0
+        all_preds: list[np.ndarray] = []
+        all_labels: list[np.ndarray] = []
+
+        n_batches = len(loader)
+        log_every = max(1, n_batches // 5)
+        t_eval = time.time()
+        for batch_idx, batch in enumerate(loader, start=1):
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    logits, labels = forward_fn(batch)
+                    loss = self.criterion(logits, labels)
+            else:
+                logits, labels = forward_fn(batch)
+                loss = self.criterion(logits, labels)
+            total_loss += loss.item() * len(labels)
+            n += len(labels)
+
+            preds = logits.argmax(dim=-1).cpu().numpy()
+            all_preds.append(preds)
+            all_labels.append(labels.cpu().numpy())
+
+            if batch_idx == 1 or batch_idx % log_every == 0 or batch_idx == n_batches:
+                logger.info(
+                    "    eval batch %d/%d  loss=%.4f  (%.1fs elapsed)",
+                    batch_idx,
+                    n_batches,
+                    loss.item(),
+                    time.time() - t_eval,
+                )
+
+        y_pred = np.concatenate(all_preds)
+        y_true = np.concatenate(all_labels)
+
+        acc = accuracy_score(y_true, y_pred) * 100
+        kappa = cohen_kappa_score(y_true, y_pred) if len(np.unique(y_true)) > 1 else 0.0
+        return total_loss / max(n, 1), acc, kappa
+
+    def fit(
+        self,
+        dataset: Dataset,
+        forward_fn: Callable | None = None,
+        model_tag: str = "model",
+        val_dataset: Dataset | None = None,
+    ) -> TrainResult:
+        """Train the model on a dataset.
+
+        Args:
+            dataset: A PyTorch Dataset whose items are batches.
+                For single-input models: (input, label)
+                For multi-input: (input1, input2, ..., label)
+            forward_fn: Function that takes a batch and returns (logits, labels).
+                If None, assumes (x, y) batches with model(x).
+            model_tag: String tag for checkpoint filenames.
+            val_dataset: Optional pre-split validation dataset.  When provided,
+                *dataset* is used entirely for training and *val_dataset* for
+                validation — the internal ``_split_dataset`` is skipped.  When
+                ``None`` (default), the existing behaviour of splitting
+                *dataset* according to ``val_fraction`` is preserved.
+
+        Returns:
+            TrainResult with training history.
+        """
+        if forward_fn is None:
+
+            def default_forward_fn(batch):
+                inputs, labels = batch
+                inputs = inputs.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+                return self.model(inputs), labels
+
+            forward_fn = default_forward_fn
+
+        if val_dataset is not None:
+            n_train = _dataset_len(dataset)
+            train_loader = DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                drop_last=n_train > self.batch_size,
+                num_workers=self.num_workers,
+                pin_memory=self.device.type == "cuda",
+                persistent_workers=self.persistent_workers if self.num_workers > 0 else False,
+                prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.batch_size * 2,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=self.device.type == "cuda",
+                persistent_workers=self.persistent_workers if self.num_workers > 0 else False,
+                prefetch_factor=self.prefetch_factor if self.num_workers > 0 else None,
+            )
+        else:
+            train_loader, val_loader = self._split_dataset(dataset)
+        optimizer, scheduler = self._make_optimizer_and_scheduler(self.epochs)
+
+        best_val_acc = 0.0
+        best_epoch = 0
+        best_ckpt_path: str | None = None
+        patience_counter = 0
+        history: list[EpochResult] = []
+
+        logger.info(
+            "Training %s | device=%s | epochs=%d | lr=%.2e | batch=%d | train=%d val=%d",
+            model_tag,
+            self.device,
+            self.epochs,
+            self.lr,
+            self.batch_size,
+            _dataset_len(train_loader.dataset),
+            _dataset_len(val_loader.dataset),
+        )
+        logger.info(
+            "  DataLoader: num_workers=%d prefetch=%s persistent=%s pin_memory=%s",
+            self.num_workers,
+            self.prefetch_factor,
+            self.persistent_workers,
+            self.device.type == "cuda",
+        )
+
+        t_start = time.time()
+        for epoch in range(1, self.epochs + 1):
+            logger.info("  Epoch %d/%d: loading first batch...", epoch, self.epochs)
+            train_loss = self._train_one_epoch(train_loader, optimizer, forward_fn)
+            val_loss, val_acc, val_kappa = self._evaluate(val_loader, forward_fn)
+            current_lr = optimizer.param_groups[0]["lr"]
+            scheduler.step()
+
+            result = EpochResult(
+                epoch=epoch,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                val_accuracy=val_acc,
+                val_kappa=val_kappa,
+                lr=current_lr,
+            )
+            history.append(result)
+
+            if epoch % max(1, self.epochs // 10) == 0 or epoch <= 5:
+                logger.info(
+                    "  [%03d/%03d] train_loss=%.4f  val_loss=%.4f  "
+                    "val_acc=%.2f%%  kappa=%.3f  lr=%.2e",
+                    epoch,
+                    self.epochs,
+                    train_loss,
+                    val_loss,
+                    val_acc,
+                    val_kappa,
+                    current_lr,
+                )
+
+            # Early stopping + checkpointing
+            if val_acc > best_val_acc + self.min_delta:
+                best_val_acc = val_acc
+                best_epoch = epoch
+                patience_counter = 0
+
+                if self.checkpoint_dir is not None:
+                    self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                    ckpt_path = self.checkpoint_dir / f"{model_tag}_best.pt"
+                    model_to_save = self.model
+                    if self.compile_model:
+                        orig_mod = getattr(self.model, "_orig_mod", None)
+                        if isinstance(orig_mod, nn.Module):
+                            model_to_save = orig_mod
+                    torch.save(model_to_save.state_dict(), ckpt_path)
+                    best_ckpt_path = str(ckpt_path)
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    logger.info(
+                        "  Early stopping at epoch %d (best=%.2f%% @ epoch %d)",
+                        epoch,
+                        best_val_acc,
+                        best_epoch,
+                    )
+                    break
+
+        elapsed = time.time() - t_start
+        logger.info(
+            "Training done in %.1fs | best_val_acc=%.2f%% @ epoch %d",
+            elapsed,
+            best_val_acc,
+            best_epoch,
+        )
+
+        return TrainResult(
+            best_val_accuracy=best_val_acc,
+            best_epoch=best_epoch,
+            final_epoch=history[-1].epoch,
+            max_epochs=self.epochs,
+            history=history,
+            best_checkpoint_path=best_ckpt_path,
+        )
+
+    @torch.inference_mode()
+    def predict(
+        self,
+        loader: DataLoader,
+        forward_fn: Callable | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run inference on a DataLoader.
+
+        Args:
+            loader: DataLoader of (inputs, labels) or multi-input batches.
+            forward_fn: Same signature as in fit(). If None, uses (x,y) convention.
+
+        Returns:
+            (y_pred, y_prob) numpy arrays.
+        """
+        if forward_fn is None:
+
+            def default_forward_fn(batch):
+                inputs, labels = batch
+                inputs = inputs.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+                return self.model(inputs), labels
+
+            forward_fn = default_forward_fn
+
+        self.model.eval()
+        all_probs: list[np.ndarray] = []
+        all_preds: list[np.ndarray] = []
+
+        for batch in loader:
+            logits, _ = forward_fn(batch)
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+            preds = logits.argmax(dim=-1).cpu().numpy()
+            all_probs.append(probs)
+            all_preds.append(preds)
+
+        return np.concatenate(all_preds), np.concatenate(all_probs)

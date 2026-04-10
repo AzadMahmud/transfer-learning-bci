@@ -1,0 +1,82 @@
+{
+  "baseline_vs_dual": [
+    {
+      "comparison": "DualBranch(Attn) vs CSP+LDA",
+      "n_subjects": 9,
+      "dual_mean": 54.552469135802475,
+      "baseline_mean": 65.77932098765433,
+      "mean_diff": -11.226851851851855,
+      "wilcoxon_stat": 1.0,
+      "wilcoxon_p": 0.0078125,
+      "t_stat": -2.5425273268604927,
+      "t_p": 0.03457448263326771,
+      "cohens_d": -1.2702277440762915,
+      "effect_size": "large"
+    },
+    {
+      "comparison": "DualBranch(Attn) vs Riemannian+LDA",
+      "n_subjects": 9,
+      "dual_mean": 54.552469135802475,
+      "baseline_mean": 64.31327160493828,
+      "mean_diff": -9.760802469135804,
+      "wilcoxon_stat": 5.5,
+      "wilcoxon_p": 0.04296875,
+      "t_stat": -2.3923881915353182,
+      "t_p": 0.043692680284038235,
+      "cohens_d": -1.1710139677805418,
+      "effect_size": "large"
+    },
+    {
+      "comparison": "DualBranch(Attn) vs ViT-Only",
+      "n_subjects": 9,
+      "dual_mean": 54.552469135802475,
+      "baseline_mean": 50.0,
+      "mean_diff": 4.552469135802475,
+      "wilcoxon_stat": 0.0,
+      "wilcoxon_p": 0.0078125,
+      "t_stat": 2.6526902636513174,
+      "t_p": 0.029133949016056426,
+      "cohens_d": 1.2504901825435868,
+      "effect_size": "large"
+    }
+  ],
+  "transfer_conditions": [],
+  "fusion_methods": {
+    "test": "Friedman",
+    "statistic": NaN,
+    "p_value": NaN,
+    "significant_at_0.05": null,
+    "per_method": {
+      "attention": {
+        "mean": 54.552469135802475,
+        "std": 4.8540635764048154,
+        "n": 9
+      },
+      "gated": {
+        "mean": 55.59413580246914,
+        "std": 4.9062183123393615,
+        "n": 9
+      }
+    }
+  },
+  "per_subject_variance": {
+    "model": "DualBranch (Attention)",
+    "n_subjects": 9,
+    "mean": 54.552469135802475,
+    "std": 4.8540635764048154,
+    "min": 50.0,
+    "max": 66.31944444444444,
+    "range": 16.319444444444443,
+    "per_subject": {
+      "1": 52.43055555555556,
+      "2": 54.166666666666664,
+      "3": 50.34722222222222,
+      "4": 50.0,
+      "5": 53.47222222222222,
+      "6": 54.513888888888886,
+      "7": 58.68055555555556,
+      "8": 51.041666666666664,
+      "9": 66.31944444444444
+    }
+  }
+}

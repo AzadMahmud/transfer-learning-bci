@@ -1,0 +1,23 @@
+{
+  "stage": "pretrain_vit",
+  "backbone": "eeg_vit_tiny_patch8_64",
+  "source": "physionet",
+  "strategy": "lp_ft",
+  "n_subjects": 109,
+  "n_source_trials": 4918,
+  "n_train": 4181,
+  "n_val": 737,
+  "val_accuracy": 54.95251017639078,
+  "val_kappa": 0.09877643626934607,
+  "val_f1": 0.5493848987108656,
+  "best_epoch": 25,
+  "elapsed_s": 467.8,
+  "checkpoint": "runs/2026-04-09_183518/checkpoints/vit_pretrained_physionet_eeg_vit.pt",
+  "lp_epochs": 8,
+  "lp_lr": 0.001,
+  "lp_best_val_acc": 50.88195386702849,
+  "ft_epochs": 60,
+  "ft_lr": 3e-05,
+  "layer_lr_decay": 0.75,
+  "ft_weight_decay": 0.05
+}

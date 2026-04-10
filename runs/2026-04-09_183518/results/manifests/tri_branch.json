@@ -1,0 +1,9 @@
+{
+  "stage": "tri_branch",
+  "outputs": {
+    "tri_branch_adaptive_within_subject": "runs/2026-04-09_183518/results/real_tri_branch_adaptive_vit.json"
+  },
+  "meta": {
+    "strategy": "within_subject"
+  }
+}

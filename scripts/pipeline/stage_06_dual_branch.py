@@ -1,0 +1,904 @@
+"""Dual-branch ablation: attention vs gated fusion (within-subject + LOSO).
+
+Loads BCI IV-2a epochs from the .npz cache and pre-cached
+9-channel spectrograms. Uses PhysioNet-pretrained ViT backbone
+weights from pretraining. Trains the full DualBranchModel with both attention
+and gated fusion methods as an ablation study.
+
+Runs within-subject 5-fold CV and LOSO CV for each fusion method.
+
+Prerequisite: Download and pretraining must have been run first.
+
+Output::
+
+    <run-dir>/results/real_dual_branch_attention_vit.json
+    <run-dir>/results/real_dual_branch_attention_vit_loso.json
+    <run-dir>/results/real_dual_branch_gated_vit.json
+    <run-dir>/plots/dual_branch_vit_attention/
+    <run-dir>/plots/dual_branch_vit_gated/
+
+Usage::
+
+    uv run python scripts/pipeline/stage_06_dual_branch.py --run-dir runs/my_run
+    uv run python scripts/pipeline/stage_06_dual_branch.py \\
+        --run-dir runs/my_run --epochs 50 --batch-size 32 --device cuda
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import bci.models.vit_branch as _vit_mod
+from bci.data.augmentation import SpectrogramAugmenter
+from bci.utils.logging import setup_stage_logging
+from bci.utils.visualization import save_confusion_matrix, save_per_subject_accuracy
+
+_BACKBONE_SHORT = {
+    _vit_mod.MODEL_NAME: _vit_mod.BACKBONE_SHORT,
+}
+
+
+def _build_model(
+    condition: str,
+    math_input_dim: int,
+    checkpoint_path: Path | None,
+    unfreeze_last_n: int = 2,
+    fusion: str = "attention",
+):
+    """Build and return a DualBranchModel for a given transfer condition.
+
+    Parameters
+    ----------
+    condition:
+        One of ``"scratch"``, ``"imagenet"``, or ``"transfer"``.
+
+        - ``"scratch"``: ViT backbone initialised with *random* weights.
+        - ``"imagenet"``: ViT backbone initialised from ImageNet pretrained weights.
+          The backbone is then partially frozen (all except the last
+          *unfreeze_last_n* transformer blocks).
+        - ``"transfer"``: Like ``"imagenet"`` but additionally loads
+          PhysioNet-pretrained weights from *checkpoint_path* into the backbone.
+    math_input_dim:
+        Dimensionality of the handcrafted feature vector (CSP + Riemannian
+        tangent-space features concatenated).
+    checkpoint_path:
+        Path to the backbone ``.pt`` checkpoint file saved by pretraining /
+        :func:`pretrain_vit`.  Required when *condition* is ``"transfer"``.
+    unfreeze_last_n:
+        Number of trailing transformer blocks to keep trainable when the backbone
+        is partially frozen (``"imagenet"`` and ``"transfer"`` conditions).
+    fusion:
+        Fusion method for the dual-branch model: ``"attention"``, ``"attention_v2"``,
+        or ``"gated"``.
+
+    Returns
+    -------
+    DualBranchModel
+    """
+    import torch
+
+    from bci.models.dual_branch import DualBranchModel
+    from bci.utils.config import ModelConfig
+
+    use_imagenet = condition in ("imagenet", "transfer")
+    cfg = ModelConfig(
+        vit_model_name="eeg_vit_tiny_patch8_64",
+        vit_pretrained=use_imagenet,
+        vit_drop_rate=0.1,
+        in_chans=9,
+        csp_n_components=6,
+        math_hidden_dims=[256, 128],
+        math_drop_rate=0.3,
+        fusion_method=fusion,
+        fused_dim=128,
+        classifier_hidden_dim=64,
+        n_classes=2,
+    )
+    model = DualBranchModel(math_input_dim=math_input_dim, config=cfg)
+
+    if condition == "transfer":
+        if checkpoint_path is None or not Path(checkpoint_path).exists():
+            raise FileNotFoundError(
+                f"Transfer condition requires a valid checkpoint; got: {checkpoint_path}"
+            )
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        backbone_state = {
+            k: v
+            for k, v in ckpt.items()
+            if not (k.startswith("head") or k.startswith("classifier"))
+        }
+        model.vit_branch.backbone.load_state_dict(backbone_state, strict=False)
+
+    if condition in ("imagenet", "transfer"):
+        model.freeze_vit_backbone(unfreeze_last_n_blocks=unfreeze_last_n)
+
+    return model
+
+
+def _train_and_eval_fold(
+    fold_idx: int,
+    subject_id: int,
+    X_train,
+    y_train,
+    X_test,
+    y_test,
+    condition: str,
+    checkpoint_path: Path | None,
+    builder,
+    device: str = "cpu",
+    epochs: int = 10,
+    lr: float = 1e-4,
+    batch_size: int = 16,
+    warmup_epochs: int = 2,
+    patience: int = 10,
+    unfreeze_last_n: int = 2,
+    fusion: str = "attention",
+    seed: int = 0,
+    num_workers: int = 0,
+    prefetch_factor: int = 2,
+    persistent_workers: bool = False,
+    use_amp: bool = False,
+    compile_model: bool = False,
+    accumulation_steps: int = 1,
+):
+    """Train and evaluate the dual-branch model for one CV fold.
+
+    Parameters
+    ----------
+    fold_idx:
+        Zero-based fold index (used for seeding and logging).
+    subject_id:
+        Subject identifier (for logging).
+    X_train, y_train:
+        Raw EEG training data of shape ``(n_train, n_channels, n_times)`` and
+        labels ``(n_train,)``.
+    X_test, y_test:
+        Raw EEG test data and labels.
+    condition:
+        Transfer condition passed to :func:`_build_model`.
+    checkpoint_path:
+        ViT backbone checkpoint path (required for ``"transfer"`` condition).
+    builder:
+        A :class:`bci.data.dual_branch_builder.DualBranchFoldBuilder` instance
+        used to build the TensorDataset pair for this fold.
+    device:
+        PyTorch device string.
+    epochs, lr, batch_size, warmup_epochs, patience:
+        Trainer hyper-parameters.
+    unfreeze_last_n:
+        Passed to :func:`_build_model`.
+    fusion:
+        Fusion method passed to :func:`_build_model`.
+    seed:
+        Random seed.
+
+    Returns
+    -------
+    FoldResult
+        A :class:`bci.training.cross_validation.FoldResult` with ``accuracy``,
+        ``kappa``, ``f1_macro``, ``n_train``, ``n_test``, ``y_true``,
+        ``y_pred``, ``y_prob`` populated.
+    """
+    import torch
+    from torch.utils.data import DataLoader
+
+    from bci.training.cross_validation import FoldResult
+    from bci.training.evaluation import compute_metrics
+    from bci.training.trainer import Trainer
+    from bci.utils.seed import set_seed
+
+    set_seed(seed + fold_idx)
+    _device = torch.device(device)
+
+    train_ds, test_ds, math_input_dim = builder.build_fold(X_train, y_train, X_test, y_test)
+    model = _build_model(
+        condition=condition,
+        math_input_dim=math_input_dim,
+        checkpoint_path=checkpoint_path,
+        unfreeze_last_n=unfreeze_last_n,
+        fusion=fusion,
+    )
+
+    def fwd(batch, _m=model):
+        imgs, feats, labels = batch
+        return (
+            _m(
+                imgs.to(_device, non_blocking=True),
+                feats.to(_device, non_blocking=True),
+            ),
+            labels.to(_device, non_blocking=True),
+        )
+
+    backbone_scale = 0.1 if condition in ("imagenet", "transfer") else None
+    trainer = Trainer(
+        model=model,
+        device=device,
+        learning_rate=lr,
+        weight_decay=1e-4,
+        epochs=epochs,
+        batch_size=batch_size,
+        warmup_epochs=warmup_epochs,
+        patience=patience,
+        label_smoothing=0.1,
+        val_fraction=0.2,
+        seed=seed,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
+        use_amp=use_amp,
+        compile_model=compile_model,
+        gradient_accumulation_steps=accumulation_steps,
+        backbone_lr_scale=backbone_scale,
+    )
+    trainer.fit(train_ds, forward_fn=fwd, model_tag=f"{condition}_fold{fold_idx}")
+
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size * 2,
+        shuffle=False,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=persistent_workers if num_workers > 0 else False,
+        pin_memory=_device.type == "cuda",
+    )
+    y_pred, y_prob = trainer.predict(test_loader, forward_fn=fwd)
+    m = compute_metrics(y_test, y_pred, y_prob)
+    return FoldResult(
+        fold=fold_idx,
+        subject=subject_id,
+        accuracy=m["accuracy"],
+        kappa=m["kappa"],
+        f1_macro=m["f1_macro"],
+        n_train=len(y_train),
+        n_test=len(y_test),
+        y_true=y_test,
+        y_pred=y_pred,
+        y_prob=y_prob,
+    )
+
+
+_FUSED_DIM = {
+    _vit_mod.MODEL_NAME: _vit_mod.DEFAULT_FUSED_DIM,
+}
+_CLASSIFIER_HIDDEN = {
+    _vit_mod.MODEL_NAME: _vit_mod.DEFAULT_CLS_HIDDEN,
+}
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Dual-branch fusion ablation (attention vs gated).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--run-dir", required=True)
+    p.add_argument(
+        "--processed-dir",
+        default=None,
+        help="Root of processed .npz cache (default: data/processed/)",
+    )
+    p.add_argument("--device", default="auto")
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--n-folds", type=int, default=5)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader worker processes (0 = main process)",
+    )
+    p.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="Batches prefetched per worker when num_workers > 0",
+    )
+    p.add_argument(
+        "--persistent-workers",
+        action="store_true",
+        help="Keep DataLoader workers alive between epochs",
+    )
+    p.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable automatic mixed precision on CUDA",
+    )
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile for the model (PyTorch 2.0+)",
+    )
+    p.add_argument(
+        "--accumulation-steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps",
+    )
+    p.add_argument("--no-mixup", action="store_true", help="Disable mixup")
+    p.add_argument("--no-spec-augment", action="store_true", help="Disable SpecAugment")
+    p.add_argument(
+        "--backbone",
+        default="eeg_vit_tiny_patch8_64",
+        choices=list(_BACKBONE_SHORT.keys()),
+    )
+    p.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Path to PhysioNet-pretrained backbone checkpoint from pretraining "
+        "(default: <run-dir>/checkpoints/vit_pretrained_physionet_eeg_vit.pt)",
+    )
+    p.add_argument(
+        "--fusions",
+        nargs="+",
+        default=["attention_v2", "attention", "gated"],
+        choices=["attention", "attention_v2", "gated"],
+        help="Fusion methods to evaluate",
+    )
+    p.add_argument(
+        "--strategies",
+        nargs="+",
+        default=["within_subject", "loso"],
+        choices=["within_subject", "loso"],
+    )
+    return p.parse_args()
+
+
+def run_dual_branch(
+    fusion: str,
+    strategy: str,
+    backbone: str,
+    bshort: str,
+    subject_data: dict,
+    subject_spec_data: dict,
+    spec_mean,
+    spec_std,
+    checkpoint_path: Path,
+    run_dir: Path,
+    n_folds: int,
+    epochs: int,
+    batch_size: int,
+    device: str,
+    seed: int,
+    log,
+    num_workers: int,
+    prefetch_factor: int,
+    persistent_workers: bool,
+    use_amp: bool,
+    compile_model: bool,
+    accumulation_steps: int,
+    use_mixup: bool,
+    use_spec_augment: bool,
+) -> Path:
+    """Run dual-branch CV for one (fusion, strategy) pair and save results."""
+    import numpy as np
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from bci.data.dual_branch_builder import DualBranchFoldBuilder
+    from bci.models.dual_branch import DualBranchModel
+    from bci.training.cross_validation import CVResult, FoldResult
+    from bci.training.evaluation import compute_metrics
+    from bci.training.splits import get_or_create_splits
+    from bci.training.trainer import Trainer
+    from bci.utils.config import ModelConfig
+    from bci.utils.seed import set_seed
+
+    MODEL_NAME = f"DualBranch-{bshort.upper()}+CSP+Riemann"
+    tag_base = f"real_dual_branch_{fusion}_{bshort}"
+    if strategy == "loso":
+        tag_base += "_loso"
+    out_path = run_dir / "results" / f"{tag_base}.json"
+    plots_dir = run_dir / "plots" / f"dual_branch_{bshort}_{fusion}_{strategy}"
+
+    if out_path.exists():
+        log.info("Already exists: %s – skipping.", out_path)
+        return out_path
+
+    _device = torch.device(device)
+    fused_dim = _FUSED_DIM.get(backbone, 256)
+    cls_hidden = _CLASSIFIER_HIDDEN.get(backbone, 128)
+    # Must match pretraining resolution
+    TARGET_IMG_SIZE = 64
+
+    builder = DualBranchFoldBuilder(
+        csp_n_components=6,
+        riemann_estimator="oas",
+        riemann_metric="riemann",
+        sfreq=128.0,
+    )
+
+    def build_model(math_input_dim: int) -> DualBranchModel:
+        cfg = ModelConfig(
+            vit_model_name=backbone,
+            vit_pretrained=True,
+            vit_drop_rate=0.1,
+            in_chans=9,
+            csp_n_components=6,
+            math_hidden_dims=[256, 128],
+            math_drop_rate=0.3,
+            fusion_method=fusion,
+            fused_dim=fused_dim,
+            classifier_hidden_dim=cls_hidden,
+            n_classes=2,
+        )
+        model = DualBranchModel(math_input_dim=math_input_dim, config=cfg, img_size=TARGET_IMG_SIZE)
+        if checkpoint_path.exists():
+            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            backbone_state = {
+                k: v
+                for k, v in ckpt.items()
+                if not (k.startswith("head") or k.startswith("classifier"))
+            }
+            model.vit_branch.backbone.load_state_dict(backbone_state, strict=False)
+        else:
+            log.warning("Checkpoint not found at %s; using ImageNet init only.", checkpoint_path)
+        model.freeze_vit_backbone(unfreeze_last_n_blocks=2)
+        return model
+
+    def normalise_specs(imgs: np.ndarray) -> np.ndarray:
+        # Resize from on-disk 224×224 to TARGET_IMG_SIZE×TARGET_IMG_SIZE
+        if imgs.shape[-1] != TARGET_IMG_SIZE:
+            t = torch.from_numpy(imgs.astype(np.float32))
+            t = torch.nn.functional.interpolate(
+                t, size=(TARGET_IMG_SIZE, TARGET_IMG_SIZE), mode="bilinear", align_corners=False
+            )
+            imgs = t.numpy()
+        return (imgs - spec_mean[None, :, None, None]) / spec_std[None, :, None, None]
+
+    def feature_cache_path(subject_id: int, fold_idx: int, tag: str) -> Path:
+        return (
+            run_dir
+            / "cache"
+            / "math_features"
+            / f"dual_branch_{fusion}_{strategy}_{tag}_s{subject_id:02d}_f{fold_idx:02d}.npz"
+        )
+
+    t0 = time.time()
+    all_folds: list[FoldResult] = []
+    subjects = sorted(subject_data.keys())
+    split_spec = get_or_create_splits(
+        run_dir=run_dir,
+        dataset="bci_iv2a",
+        subject_data=subject_data,
+        n_folds=n_folds,
+        seed=seed,
+    )
+
+    if strategy == "within_subject":
+        fold_counter = 0
+        for sid in subjects:
+            X, y = subject_data[sid]
+            spec_imgs, _ = subject_spec_data[sid]
+            log.info("Subject %d (%d trials)...", sid, len(y))
+            folds = split_spec.within_subject.get(sid, [])
+            for fold_idx, fold in enumerate(folds):
+                train_idx = np.array(fold["train_idx"], dtype=int)
+                test_idx = np.array(fold["test_idx"], dtype=int)
+                set_seed(seed + fold_counter)
+                features_train, features_test, math_input_dim = builder.build_math_features(
+                    X[train_idx],
+                    y[train_idx],
+                    X[test_idx],
+                    y[test_idx],
+                    cache_path=feature_cache_path(sid, fold_idx, "within"),
+                )
+                # Replace image tensors with cached normalised spectrograms
+                spec_train = normalise_specs(spec_imgs[train_idx]).astype(np.float32)
+                spec_test = normalise_specs(spec_imgs[test_idx]).astype(np.float32)
+                train_ds = TensorDataset(
+                    torch.from_numpy(spec_train),
+                    torch.from_numpy(features_train),
+                    torch.from_numpy(y[train_idx].astype(np.int64)),
+                )
+                test_ds = TensorDataset(
+                    torch.from_numpy(spec_test),
+                    torch.from_numpy(features_test),
+                    torch.from_numpy(y[test_idx].astype(np.int64)),
+                )
+
+                model = build_model(math_input_dim)
+                from bci.utils.config import AugmentationConfig
+
+                aug = SpectrogramAugmenter(
+                    AugmentationConfig(
+                        apply_freq_mask=True,
+                        freq_mask_max_width=8,
+                        apply_time_mask=True,
+                        time_mask_max_width=16,
+                        apply_mixup=False,
+                    ),
+                    seed=seed + fold_counter,
+                )
+                rng = np.random.default_rng(seed + fold_counter)
+
+                def fwd(batch, _m=model):
+                    imgs, feats, labels = batch
+                    imgs = imgs.to(_device, non_blocking=True)
+                    feats = feats.to(_device, non_blocking=True)
+                    labels = labels.to(_device, non_blocking=True)
+                    if _m.training and use_spec_augment:
+                        imgs_np = imgs.detach().cpu().numpy()
+                        imgs = torch.from_numpy(aug(imgs_np, training=True)).to(
+                            _device, non_blocking=True
+                        )
+                    if _m.training and use_mixup and imgs.shape[0] > 1 and rng.random() < 0.5:
+                        lam = float(rng.beta(0.4, 0.4))
+                        perm = torch.randperm(imgs.shape[0], device=_device)
+                        imgs_m = lam * imgs + (1.0 - lam) * imgs[perm]
+                        feats_m = lam * feats + (1.0 - lam) * feats[perm]
+                        logits = _m(imgs_m, feats_m)
+                        return logits, (labels, labels[perm], lam)
+                    return (
+                        _m(imgs, feats),
+                        labels,
+                    )
+
+                trainer = Trainer(
+                    model=model,
+                    device=device,
+                    learning_rate=3e-4,
+                    weight_decay=0.05,
+                    epochs=epochs,
+                    batch_size=batch_size,
+                    warmup_epochs=10,
+                    patience=20,
+                    label_smoothing=0.1,
+                    val_fraction=0.2,
+                    seed=seed,
+                    num_workers=num_workers,
+                    prefetch_factor=prefetch_factor,
+                    persistent_workers=persistent_workers,
+                    use_amp=use_amp,
+                    compile_model=compile_model,
+                    gradient_accumulation_steps=accumulation_steps,
+                )
+                train_result = trainer.fit(
+                    train_ds,
+                    forward_fn=fwd,
+                    model_tag=f"dual_{fusion}_{bshort}_f{fold_counter}",
+                )
+                test_loader = DataLoader(
+                    test_ds,
+                    batch_size=batch_size * 2,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                    persistent_workers=persistent_workers if num_workers > 0 else False,
+                    pin_memory=_device.type == "cuda",
+                )
+                y_pred, y_prob = trainer.predict(test_loader, forward_fn=fwd)
+                m = compute_metrics(y[test_idx], y_pred, y_prob)
+                fr = FoldResult(
+                    fold=fold_idx,
+                    subject=sid,
+                    accuracy=m["accuracy"],
+                    kappa=m["kappa"],
+                    f1_macro=m["f1_macro"],
+                    n_train=len(train_idx),
+                    n_test=len(test_idx),
+                    y_true=y[test_idx],
+                    y_pred=y_pred,
+                    y_prob=y_prob,
+                )
+                log.info(
+                    "  Fold %d [S%02d]: acc=%.2f%%  kappa=%.3f",
+                    fold_idx,
+                    sid,
+                    fr.accuracy,
+                    fr.kappa,
+                )
+                all_folds.append(fr)
+                fold_counter += 1
+
+    else:  # loso
+        for fold_idx, test_sid in enumerate(split_spec.loso_subjects):
+            train_sids = [s for s in split_spec.loso_subjects if s != test_sid]
+            X_train = np.concatenate([subject_data[s][0] for s in train_sids])
+            y_train = np.concatenate([subject_data[s][1] for s in train_sids])
+            X_test, y_test = subject_data[test_sid]
+            spec_train = np.concatenate([subject_spec_data[s][0] for s in train_sids])
+            spec_test, _ = subject_spec_data[test_sid]
+
+            log.info("LOSO fold %d/%d: test=S%02d", fold_idx + 1, len(subjects), test_sid)
+            set_seed(seed + fold_idx)
+
+            features_train, features_test, math_input_dim = builder.build_math_features(
+                X_train,
+                y_train,
+                X_test,
+                y_test,
+                cache_path=feature_cache_path(test_sid, fold_idx, "loso"),
+            )
+            spec_train_n = normalise_specs(spec_train).astype(np.float32)
+            spec_test_n = normalise_specs(spec_test).astype(np.float32)
+            train_ds = TensorDataset(
+                torch.from_numpy(spec_train_n),
+                torch.from_numpy(features_train),
+                torch.from_numpy(y_train.astype(np.int64)),
+            )
+            test_ds = TensorDataset(
+                torch.from_numpy(spec_test_n),
+                torch.from_numpy(features_test),
+                torch.from_numpy(y_test.astype(np.int64)),
+            )
+
+            model = build_model(math_input_dim)
+            from bci.utils.config import AugmentationConfig
+
+            aug = SpectrogramAugmenter(
+                AugmentationConfig(
+                    apply_freq_mask=True,
+                    freq_mask_max_width=8,
+                    apply_time_mask=True,
+                    time_mask_max_width=16,
+                    apply_mixup=False,
+                ),
+                seed=seed + fold_idx,
+            )
+            rng = np.random.default_rng(seed + fold_idx)
+
+            def fwd(batch, _m=model):
+                imgs, feats, labels = batch
+                imgs = imgs.to(_device, non_blocking=True)
+                feats = feats.to(_device, non_blocking=True)
+                labels = labels.to(_device, non_blocking=True)
+                if _m.training and use_spec_augment:
+                    imgs_np = imgs.detach().cpu().numpy()
+                    imgs = torch.from_numpy(aug(imgs_np, training=True)).to(
+                        _device, non_blocking=True
+                    )
+                if _m.training and use_mixup and imgs.shape[0] > 1 and rng.random() < 0.5:
+                    lam = float(rng.beta(0.4, 0.4))
+                    perm = torch.randperm(imgs.shape[0], device=_device)
+                    imgs_m = lam * imgs + (1.0 - lam) * imgs[perm]
+                    feats_m = lam * feats + (1.0 - lam) * feats[perm]
+                    logits = _m(imgs_m, feats_m)
+                    return logits, (labels, labels[perm], lam)
+                return (
+                    _m(imgs, feats),
+                    labels,
+                )
+
+            trainer = Trainer(
+                model=model,
+                device=device,
+                learning_rate=3e-4,
+                weight_decay=0.05,
+                epochs=epochs,
+                batch_size=batch_size,
+                warmup_epochs=10,
+                patience=20,
+                label_smoothing=0.1,
+                val_fraction=0.2,
+                seed=seed,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor,
+                persistent_workers=persistent_workers,
+                use_amp=use_amp,
+                compile_model=compile_model,
+                gradient_accumulation_steps=accumulation_steps,
+            )
+            train_result = trainer.fit(
+                train_ds,
+                forward_fn=fwd,
+                model_tag=f"dual_{fusion}_{bshort}_loso_f{fold_idx}",
+            )
+            test_loader = DataLoader(
+                test_ds,
+                batch_size=batch_size * 2,
+                shuffle=False,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                persistent_workers=persistent_workers if num_workers > 0 else False,
+                pin_memory=_device.type == "cuda",
+            )
+            y_pred, y_prob = trainer.predict(test_loader, forward_fn=fwd)
+            m = compute_metrics(y_test, y_pred, y_prob)
+            fr = FoldResult(
+                fold=fold_idx,
+                subject=test_sid,
+                accuracy=m["accuracy"],
+                kappa=m["kappa"],
+                f1_macro=m["f1_macro"],
+                n_train=len(y_train),
+                n_test=len(y_test),
+                y_true=y_test,
+                y_pred=y_pred,
+                y_prob=y_prob,
+            )
+            log.info(
+                "  LOSO fold %d [S%02d]: acc=%.2f%%  kappa=%.3f",
+                fold_idx,
+                test_sid,
+                fr.accuracy,
+                fr.kappa,
+            )
+            all_folds.append(fr)
+
+    elapsed = time.time() - t0
+    result = CVResult(strategy=strategy, model_name=MODEL_NAME, folds=all_folds)
+    log.info(
+        "%s [%s] done in %.1fs: %.2f%% ± %.2f%%",
+        fusion,
+        strategy,
+        elapsed,
+        result.mean_accuracy,
+        result.std_accuracy,
+    )
+
+    # ── Summary plots ──────────────────────────────────────────────────────
+    fusion_label = fusion.replace("_", " ").title()
+    strategy_label = "Within-Subject CV" if strategy == "within_subject" else "LOSO CV"
+    try:
+        agg_y_true = np.concatenate([f.y_true for f in all_folds])
+        agg_y_pred = np.concatenate([f.y_pred for f in all_folds])
+        save_confusion_matrix(
+            agg_y_true,
+            agg_y_pred,
+            plots_dir,
+            filename="confusion_matrix",
+            title=f"Dual-Branch {fusion_label} Fusion ({strategy_label})",
+        )
+    except Exception as e:
+        log.warning("Confusion matrix plot failed: %s", e)
+
+    if strategy == "within_subject":
+        try:
+            save_per_subject_accuracy(
+                result.per_subject_accuracy,
+                plots_dir,
+                filename="per_subject_accuracy",
+                title=f"Dual-Branch {fusion_label} Fusion \u2013 Per-Subject Accuracy ({strategy_label})",
+            )
+        except Exception as e:
+            log.warning("Per-subject plot failed: %s", e)
+
+    data = {
+        "model": MODEL_NAME,
+        "backbone": backbone,
+        "fusion": fusion,
+        "strategy": strategy,
+        "mean_accuracy": result.mean_accuracy,
+        "std_accuracy": result.std_accuracy,
+        "mean_kappa": result.mean_kappa,
+        "mean_f1": result.mean_f1,
+        "n_folds": len(all_folds),
+        "per_subject": result.per_subject_accuracy,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(data, f, indent=2)
+    try:
+        from bci.utils.results_index import update_results_index, write_manifest
+
+        outputs = {f"{fusion}_{strategy}": str(out_path)}
+        update_results_index(run_dir, "dual_branch", outputs)
+        write_manifest(
+            run_dir,
+            "dual_branch",
+            outputs,
+            meta={"fusion": fusion, "strategy": strategy},
+        )
+    except Exception as e:
+        log.warning("Failed to update results index: %s", e)
+    log.info("Saved: %s", out_path)
+    return out_path
+
+
+def main() -> None:
+    args = parse_args()
+    run_dir = Path(args.run_dir)
+    backbone = args.backbone
+    bshort = str(_BACKBONE_SHORT.get(backbone, backbone) or backbone)
+    log = setup_stage_logging(run_dir, "dual_branch", f"dual_branch_{bshort}.log")
+    log.info("Backbone: %s  (short: %s)", backbone, bshort)
+
+    checkpoint_path = (
+        Path(args.checkpoint)
+        if args.checkpoint
+        else run_dir / "checkpoints" / "vit_pretrained_physionet_eeg_vit.pt"
+    )
+    processed_dir = Path(args.processed_dir) if args.processed_dir else None
+
+    import numpy as np
+
+    from bci.data.download import (
+        load_all_subjects,
+        load_spectrogram_stats,
+        load_subject_spectrograms,
+    )
+    from bci.data.download import _processed_dir as _get_processed_dir
+    from bci.utils.seed import get_device, set_seed
+
+    device = get_device(args.device)
+    log.info("Device: %s", device)
+    set_seed(args.seed)
+
+    # ── Load epoch cache ───────────────────────────────────────────────────
+    log.info("Loading BCI IV-2a epoch cache...")
+    try:
+        subject_data, channel_names, sfreq = load_all_subjects("bci_iv2a", data_dir=processed_dir)
+    except FileNotFoundError as e:
+        log.error("%s  Run the download step first.", e)
+        sys.exit(1)
+    log.info(
+        "Loaded %d subjects (sfreq=%.0f Hz, %d channels)",
+        len(subject_data),
+        sfreq,
+        len(channel_names),
+    )
+
+    # ── Load spectrogram cache ─────────────────────────────────────────────
+    log.info("Loading BCI IV-2a spectrogram cache...")
+    try:
+        spec_mean, spec_std = load_spectrogram_stats("bci_iv2a", data_dir=processed_dir)
+    except FileNotFoundError as e:
+        log.error("%s  Run the download step first.", e)
+        sys.exit(1)
+
+    pdir = _get_processed_dir("bci_iv2a", processed_dir)
+    spec_files = sorted(pdir.glob("subject_[0-9]*_spectrograms.npz"))
+    subject_ids = [int(p.stem.split("_")[1]) for p in spec_files]
+
+    subject_spec_data: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for sid in subject_ids:
+        try:
+            imgs, y = load_subject_spectrograms("bci_iv2a", sid, data_dir=processed_dir)
+            subject_spec_data[sid] = (imgs, y)
+        except Exception as e:
+            log.warning("  Subject %d spectrograms skipped: %s", sid, e)
+
+    # Only keep subjects that have both epoch and spectrogram data
+    common_sids = sorted(set(subject_data.keys()) & set(subject_spec_data.keys()))
+    subject_data = {s: subject_data[s] for s in common_sids}
+    subject_spec_data = {s: subject_spec_data[s] for s in common_sids}
+    log.info("Using %d subjects with both epoch and spectrogram data.", len(common_sids))
+
+    if not common_sids:
+        log.error("No subjects with complete data. Exiting.")
+        sys.exit(1)
+
+    if not checkpoint_path.exists():
+        log.error("PhysioNet checkpoint not found at %s. Run pretraining first.", checkpoint_path)
+        sys.exit(1)
+
+    # ── Run ablation ───────────────────────────────────────────────────────
+    for fusion in args.fusions:
+        for strategy in args.strategies:
+            log.info("=== Fusion: %s | Strategy: %s ===", fusion.upper(), strategy)
+            run_dual_branch(
+                fusion=fusion,
+                strategy=strategy,
+                backbone=backbone,
+                bshort=str(bshort),
+                subject_data=subject_data,
+                subject_spec_data=subject_spec_data,
+                spec_mean=spec_mean,
+                spec_std=spec_std,
+                checkpoint_path=checkpoint_path,
+                run_dir=run_dir,
+                n_folds=args.n_folds,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                device=str(device),
+                seed=args.seed,
+                log=log,
+                num_workers=args.num_workers,
+                prefetch_factor=args.prefetch_factor,
+                persistent_workers=args.persistent_workers,
+                use_amp=args.amp,
+                compile_model=args.compile,
+                accumulation_steps=args.accumulation_steps,
+                use_mixup=not args.no_mixup,
+                use_spec_augment=not args.no_spec_augment,
+            )
+
+    log.info("Dual-branch ablation complete.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+{
+  "stage": "vit_baseline",
+  "outputs": {
+    "loso": "runs/2026-04-09_183518/results/real_baseline_c_vit_loso.json"
+  },
+  "meta": {
+    "strategy": "loso"
+  }
+}

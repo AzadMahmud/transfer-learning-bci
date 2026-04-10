@@ -1,0 +1,639 @@
+"""EEG-ViT-only classifier on BCI IV-2a spectrograms.
+
+Loads pre-cached 9-channel multichannel CWT spectrograms for BCI IV-2a
+subjects and fine-tunes an EEG-ViT classifier.
+Uses PhysioNet-pretrained backbone weights from pretraining.
+Runs 5-fold within-subject CV and LOSO CV.
+
+Prerequisite: Download and pretraining must have been run first.
+
+Output::
+
+    <run-dir>/results/real_baseline_c_vit.json
+    <run-dir>/plots/vit_baseline/  (per-fold training curves + confusion matrices)
+
+Usage::
+
+    uv run python scripts/pipeline/stage_05_vit_baseline.py --run-dir runs/my_run
+    uv run python scripts/pipeline/stage_05_vit_baseline.py \\
+        --run-dir runs/my_run --epochs 50 --batch-size 32 --device cuda
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+from bci.data.augmentation import SpectrogramAugmenter
+from bci.utils.logging import setup_stage_logging
+from bci.utils.visualization import save_confusion_matrix, save_per_subject_accuracy
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Baseline C – ViT-only on cached spectrograms.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--run-dir", required=True)
+    p.add_argument(
+        "--processed-dir",
+        default=None,
+        help="Root of processed .npz cache (default: data/processed/)",
+    )
+    p.add_argument("--device", default="auto")
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--learning-rate", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=0.05)
+    p.add_argument("--warmup-epochs", type=int, default=10)
+    p.add_argument("--patience", type=int, default=20)
+    p.add_argument("--label-smoothing", type=float, default=0.1)
+    p.add_argument(
+        "--backbone-lr-scale",
+        type=float,
+        default=0.25,
+        help="Backbone LR scale vs head LR (set <=0 to disable differential LR)",
+    )
+    p.add_argument(
+        "--layer-lr-decay",
+        type=float,
+        default=None,
+        help="Layer-wise LR decay (0-1); if set, overrides backbone-lr-scale",
+    )
+    p.add_argument("--val-fraction", type=float, default=0.2)
+    p.add_argument("--vit-drop-rate", type=float, default=0.15)
+    p.add_argument("--n-folds", type=int, default=5)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="DataLoader worker processes (0 = main process)",
+    )
+    p.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="Batches prefetched per worker when num_workers > 0",
+    )
+    p.add_argument(
+        "--persistent-workers",
+        action="store_true",
+        help="Keep DataLoader workers alive between epochs",
+    )
+    p.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable automatic mixed precision on CUDA",
+    )
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile for the model (PyTorch 2.0+)",
+    )
+    p.add_argument(
+        "--accumulation-steps",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps",
+    )
+    p.add_argument("--no-mixup", action="store_true", help="Disable mixup")
+    p.add_argument("--no-spec-augment", action="store_true", help="Disable SpecAugment")
+    p.add_argument("--mixup-alpha", type=float, default=0.4)
+    p.add_argument("--mixup-prob", type=float, default=0.5)
+    p.add_argument("--freq-mask-max-width", type=int, default=8)
+    p.add_argument("--time-mask-max-width", type=int, default=16)
+    p.add_argument(
+        "--unfreeze-last-n",
+        type=int,
+        default=2,
+        help="Unfreeze only last N transformer blocks (0 = unfreeze all)",
+    )
+    p.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Path to PhysioNet-pretrained backbone checkpoint from pretraining "
+        "(default: <run-dir>/checkpoints/vit_pretrained_physionet_eeg_vit.pt)",
+    )
+    p.add_argument(
+        "--strategies",
+        nargs="+",
+        default=["within_subject", "loso"],
+        choices=["within_subject", "loso"],
+        help="CV strategies to run",
+    )
+    p.add_argument("--force", action="store_true", help="Overwrite existing outputs")
+    args, _ = p.parse_known_args()
+    return args
+
+
+def run_vit_cv(
+    strategy: str,
+    subject_spec_data: dict,
+    spec_mean,
+    spec_std,
+    checkpoint_path: Path,
+    run_dir: Path,
+    n_folds: int,
+    epochs: int,
+    batch_size: int,
+    device: str,
+    seed: int,
+    log,
+    num_workers: int,
+    prefetch_factor: int,
+    persistent_workers: bool,
+    use_amp: bool,
+    compile_model: bool,
+    accumulation_steps: int,
+    use_mixup: bool,
+    use_spec_augment: bool,
+    mixup_alpha: float,
+    mixup_prob: float,
+    freq_mask_max_width: int,
+    time_mask_max_width: int,
+    learning_rate: float,
+    weight_decay: float,
+    warmup_epochs: int,
+    patience: int,
+    label_smoothing: float,
+    backbone_lr_scale: float,
+    layer_lr_decay: float | None,
+    val_fraction: float,
+    vit_drop_rate: float,
+    unfreeze_last_n: int,
+    force: bool,
+) -> Path:
+    """Run ViT-only CV (within_subject or loso) and save results."""
+    import numpy as np
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+
+    from bci.models.vit_branch import ViTBranch
+    from bci.training.cross_validation import CVResult, FoldResult
+    from bci.training.evaluation import compute_metrics
+    from bci.training.splits import get_or_create_splits
+    from bci.training.trainer import Trainer
+    from bci.utils.config import AugmentationConfig, ModelConfig
+    from bci.utils.seed import set_seed
+
+    MODEL_NAME = "CWT+EEG-ViT (PhysioNet pretrained)"
+    BACKBONE = "eeg_vit_tiny_patch8_64"
+    # Must match the img_size used in pretraining.
+    TARGET_IMG_SIZE = 64
+
+    tag_base = "real_baseline_c_vit"
+    if strategy == "loso":
+        tag_base += "_loso"
+    out_path = run_dir / "results" / f"{tag_base}.json"
+    plots_dir = run_dir / "plots" / f"vit_baseline_{strategy}"
+
+    if out_path.exists() and not force:
+        log.info("Already exists: %s – skipping.", out_path)
+        return out_path
+
+    _device = torch.device(device)
+
+    def build_model():
+        cfg = ModelConfig(
+            vit_model_name=BACKBONE,
+            vit_pretrained=True,
+            vit_drop_rate=vit_drop_rate,
+            in_chans=9,
+            n_classes=2,
+        )
+        model = ViTBranch(config=cfg, as_feature_extractor=False, img_size=TARGET_IMG_SIZE)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"PhysioNet checkpoint not found at {checkpoint_path}; run pretraining first."
+            )
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        # Strip head keys to load only backbone weights
+        backbone_state = {
+            k: v
+            for k, v in ckpt.items()
+            if not (k.startswith("head") or k.startswith("classifier"))
+        }
+        model.backbone.load_state_dict(backbone_state, strict=False)
+        if unfreeze_last_n <= 0:
+            model.unfreeze_all()
+        else:
+            model.freeze_backbone(unfreeze_last_n_blocks=unfreeze_last_n)
+        return model
+
+    def make_ds(imgs, y):
+        # Resize from on-disk 224×224 to TARGET_IMG_SIZE×TARGET_IMG_SIZE.
+        # Reduces ViT forward-pass cost by ~12× with minimal accuracy impact.
+        if imgs.shape[-1] != TARGET_IMG_SIZE:
+            t = torch.from_numpy(imgs.astype(np.float32))
+            t = torch.nn.functional.interpolate(
+                t, size=(TARGET_IMG_SIZE, TARGET_IMG_SIZE), mode="bilinear", align_corners=False
+            )
+            imgs = t.numpy()
+        # Normalise per-channel using training-set stats
+        imgs_norm = (imgs - spec_mean[None, :, None, None]) / spec_std[None, :, None, None]
+        return TensorDataset(
+            torch.from_numpy(imgs_norm.astype(np.float32)),
+            torch.from_numpy(y.astype(np.int64)),
+        )
+
+    t0 = time.time()
+    all_folds: list[FoldResult] = []
+    subjects = sorted(subject_spec_data.keys())
+    split_spec = get_or_create_splits(
+        run_dir=run_dir,
+        dataset="bci_iv2a",
+        subject_data={
+            sid: (subject_spec_data[sid][0], subject_spec_data[sid][1]) for sid in subjects
+        },
+        n_folds=n_folds,
+        seed=seed,
+    )
+
+    if strategy == "within_subject":
+        fold_counter = 0
+        for sid in subjects:
+            imgs, y = subject_spec_data[sid]
+            log.info("Subject %d (%d trials)...", sid, len(y))
+            folds = split_spec.within_subject.get(sid, [])
+            for fold_idx, fold in enumerate(folds):
+                train_idx = np.array(fold["train_idx"], dtype=int)
+                test_idx = np.array(fold["test_idx"], dtype=int)
+                set_seed(seed + fold_counter)
+                train_ds = make_ds(imgs[train_idx], y[train_idx])
+                test_ds = make_ds(imgs[test_idx], y[test_idx])
+                model = build_model()
+                aug = SpectrogramAugmenter(
+                    AugmentationConfig(
+                        apply_freq_mask=True,
+                        freq_mask_max_width=freq_mask_max_width,
+                        apply_time_mask=True,
+                        time_mask_max_width=time_mask_max_width,
+                        apply_mixup=False,
+                    ),
+                    seed=seed + fold_counter,
+                )
+                rng = np.random.default_rng(seed + fold_counter)
+
+                def fwd(batch, _m=model):
+                    x, labels = batch
+                    x = x.to(_device, non_blocking=True)
+                    labels = labels.to(_device, non_blocking=True)
+                    if _m.training and use_spec_augment:
+                        x_np = x.detach().cpu().numpy()
+                        x = torch.from_numpy(aug(x_np, training=True)).to(
+                            _device, non_blocking=True
+                        )
+                    if _m.training and use_mixup and x.shape[0] > 1 and rng.random() < mixup_prob:
+                        lam = float(rng.beta(mixup_alpha, mixup_alpha))
+                        perm = torch.randperm(x.shape[0], device=_device)
+                        x_mix = lam * x + (1.0 - lam) * x[perm]
+                        logits = _m(x_mix)
+                        return logits, (labels, labels[perm], lam)
+                    return _m(x), labels
+
+                trainer = Trainer(
+                    model=model,
+                    device=device,
+                    learning_rate=learning_rate,
+                    weight_decay=weight_decay,
+                    epochs=epochs,
+                    batch_size=batch_size,
+                    warmup_epochs=warmup_epochs,
+                    patience=patience,
+                    label_smoothing=label_smoothing,
+                    val_fraction=val_fraction,
+                    seed=seed,
+                    num_workers=num_workers,
+                    prefetch_factor=prefetch_factor,
+                    persistent_workers=persistent_workers,
+                    use_amp=use_amp,
+                    compile_model=compile_model,
+                    gradient_accumulation_steps=accumulation_steps,
+                    backbone_lr_scale=backbone_lr_scale if backbone_lr_scale > 0 else None,
+                    layer_lr_decay=layer_lr_decay,
+                )
+                train_result = trainer.fit(
+                    train_ds, forward_fn=fwd, model_tag=f"vit_within_f{fold_counter}"
+                )
+                test_loader = DataLoader(
+                    test_ds,
+                    batch_size=batch_size * 2,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                    persistent_workers=persistent_workers if num_workers > 0 else False,
+                    pin_memory=_device.type == "cuda",
+                )
+                y_pred, y_prob = trainer.predict(test_loader, forward_fn=fwd)
+                m = compute_metrics(y[test_idx], y_pred, y_prob)
+                fr = FoldResult(
+                    fold=fold_idx,
+                    subject=sid,
+                    accuracy=m["accuracy"],
+                    kappa=m["kappa"],
+                    f1_macro=m["f1_macro"],
+                    n_train=len(train_idx),
+                    n_test=len(test_idx),
+                    y_true=y[test_idx],
+                    y_pred=y_pred,
+                    y_prob=y_prob,
+                )
+                log.info(
+                    "  Fold %d [S%02d]: acc=%.2f%%  kappa=%.3f",
+                    fold_idx,
+                    sid,
+                    fr.accuracy,
+                    fr.kappa,
+                )
+                all_folds.append(fr)
+                fold_counter += 1
+
+    else:  # loso
+        for fold_idx, test_sid in enumerate(split_spec.loso_subjects):
+            train_sids = [s for s in split_spec.loso_subjects if s != test_sid]
+            train_imgs = np.concatenate([subject_spec_data[s][0] for s in train_sids])
+            train_y = np.concatenate([subject_spec_data[s][1] for s in train_sids])
+            test_imgs, test_y = subject_spec_data[test_sid]
+            log.info("LOSO fold %d/%d: test=S%02d", fold_idx + 1, len(subjects), test_sid)
+
+            set_seed(seed + fold_idx)
+            train_ds = make_ds(train_imgs, train_y)
+            test_ds = make_ds(test_imgs, test_y)
+            model = build_model()
+            aug = SpectrogramAugmenter(
+                AugmentationConfig(
+                    apply_freq_mask=True,
+                    freq_mask_max_width=freq_mask_max_width,
+                    apply_time_mask=True,
+                    time_mask_max_width=time_mask_max_width,
+                    apply_mixup=False,
+                ),
+                seed=seed + fold_idx,
+            )
+            rng = np.random.default_rng(seed + fold_idx)
+
+            def fwd(batch, _m=model):
+                x, labels = batch
+                x = x.to(_device, non_blocking=True)
+                labels = labels.to(_device, non_blocking=True)
+                if _m.training and use_spec_augment:
+                    x_np = x.detach().cpu().numpy()
+                    x = torch.from_numpy(aug(x_np, training=True)).to(_device, non_blocking=True)
+                if _m.training and use_mixup and x.shape[0] > 1 and rng.random() < mixup_prob:
+                    lam = float(rng.beta(mixup_alpha, mixup_alpha))
+                    perm = torch.randperm(x.shape[0], device=_device)
+                    x_mix = lam * x + (1.0 - lam) * x[perm]
+                    logits = _m(x_mix)
+                    return logits, (labels, labels[perm], lam)
+                return _m(x), labels
+
+            trainer = Trainer(
+                model=model,
+                device=device,
+                learning_rate=learning_rate,
+                weight_decay=weight_decay,
+                epochs=epochs,
+                batch_size=batch_size,
+                warmup_epochs=warmup_epochs,
+                patience=patience,
+                label_smoothing=label_smoothing,
+                val_fraction=val_fraction,
+                seed=seed,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor,
+                persistent_workers=persistent_workers,
+                use_amp=use_amp,
+                compile_model=compile_model,
+                gradient_accumulation_steps=accumulation_steps,
+                backbone_lr_scale=backbone_lr_scale if backbone_lr_scale > 0 else None,
+                layer_lr_decay=layer_lr_decay,
+            )
+            train_result = trainer.fit(train_ds, forward_fn=fwd, model_tag=f"vit_loso_f{fold_idx}")
+            test_loader = DataLoader(
+                test_ds,
+                batch_size=batch_size * 2,
+                shuffle=False,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                persistent_workers=persistent_workers if num_workers > 0 else False,
+                pin_memory=_device.type == "cuda",
+            )
+            y_pred, y_prob = trainer.predict(test_loader, forward_fn=fwd)
+            m = compute_metrics(test_y, y_pred, y_prob)
+            fr = FoldResult(
+                fold=fold_idx,
+                subject=test_sid,
+                accuracy=m["accuracy"],
+                kappa=m["kappa"],
+                f1_macro=m["f1_macro"],
+                n_train=len(train_y),
+                n_test=len(test_y),
+                y_true=test_y,
+                y_pred=y_pred,
+                y_prob=y_prob,
+            )
+            log.info(
+                "  LOSO fold %d [S%02d]: acc=%.2f%%  kappa=%.3f",
+                fold_idx,
+                test_sid,
+                fr.accuracy,
+                fr.kappa,
+            )
+            all_folds.append(fr)
+
+    elapsed = time.time() - t0
+    result = CVResult(strategy=strategy, model_name=MODEL_NAME, folds=all_folds)
+    log.info(
+        "%s done in %.1fs: %.2f%% ± %.2f%%",
+        strategy,
+        elapsed,
+        result.mean_accuracy,
+        result.std_accuracy,
+    )
+
+    # ── Summary plots ──────────────────────────────────────────────────────
+    strategy_label = "Within-Subject CV" if strategy == "within_subject" else "LOSO CV"
+    try:
+        import numpy as _np
+
+        agg_y_true = _np.concatenate([f.y_true for f in all_folds])
+        agg_y_pred = _np.concatenate([f.y_pred for f in all_folds])
+        save_confusion_matrix(
+            agg_y_true,
+            agg_y_pred,
+            plots_dir,
+            filename="confusion_matrix",
+            title=f"ViT-Only Baseline ({strategy_label})",
+        )
+    except Exception as e:
+        log.warning("Confusion matrix plot failed: %s", e)
+
+    if strategy == "within_subject":
+        try:
+            save_per_subject_accuracy(
+                result.per_subject_accuracy,
+                plots_dir,
+                filename="per_subject_accuracy",
+                title=f"ViT-Only Baseline \u2013 Per-Subject Accuracy ({strategy_label})",
+            )
+        except Exception as e:
+            log.warning("Per-subject plot failed: %s", e)
+
+    # Build output dict keyed for compatibility with phase4_compile_results.py
+    data: dict
+    if strategy == "within_subject":
+        data = {
+            "model": MODEL_NAME,
+            "backbone": BACKBONE,
+            "within_subject": {
+                "mean_accuracy": result.mean_accuracy,
+                "std_accuracy": result.std_accuracy,
+                "mean_kappa": result.mean_kappa,
+                "mean_f1": result.mean_f1,
+                "n_folds": len(all_folds),
+                "per_subject": result.per_subject_accuracy,
+            },
+        }
+    else:
+        data = {
+            "model": MODEL_NAME,
+            "backbone": BACKBONE,
+            "strategy": "loso",
+            "mean_accuracy": result.mean_accuracy,
+            "std_accuracy": result.std_accuracy,
+            "mean_kappa": result.mean_kappa,
+            "mean_f1": result.mean_f1,
+            "n_folds": len(all_folds),
+            "per_subject": result.per_subject_accuracy,
+        }
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(data, f, indent=2)
+    try:
+        from bci.utils.results_index import update_results_index, write_manifest
+
+        outputs = {f"{strategy}": str(out_path)}
+        update_results_index(run_dir, "vit_baseline", outputs)
+        write_manifest(
+            run_dir,
+            "vit_baseline",
+            outputs,
+            meta={"strategy": strategy},
+        )
+    except Exception as e:
+        log.warning("Failed to update results index: %s", e)
+    log.info("Saved: %s", out_path)
+    return out_path
+
+
+def main() -> None:
+    args = parse_args()
+    run_dir = Path(args.run_dir)
+    log = setup_stage_logging(run_dir, "vit_baseline", "vit_baseline.log")
+
+    checkpoint_path = (
+        Path(args.checkpoint)
+        if args.checkpoint
+        else run_dir / "checkpoints" / "vit_pretrained_physionet_eeg_vit.pt"
+    )
+    processed_dir = Path(args.processed_dir) if args.processed_dir else None
+
+    import numpy as np
+
+    from bci.data.download import load_spectrogram_stats, load_subject_spectrograms
+    from bci.data.download import _processed_dir as _get_processed_dir
+    from bci.utils.seed import get_device, set_seed
+
+    device = get_device(args.device)
+    log.info("Device: %s", device)
+    set_seed(args.seed)
+
+    # ── Load spectrogram stats ─────────────────────────────────────────────
+    log.info("Loading BCI IV-2a spectrogram stats...")
+    try:
+        spec_mean, spec_std = load_spectrogram_stats("bci_iv2a", data_dir=processed_dir)
+    except FileNotFoundError as e:
+        log.error("%s  Run the download step first.", e)
+        sys.exit(1)
+
+    # ── Discover available subjects ────────────────────────────────────────
+    pdir = _get_processed_dir("bci_iv2a", processed_dir)
+    spec_files = sorted(pdir.glob("subject_[0-9]*_spectrograms.npz"))
+    if not spec_files:
+        log.error("No BCI IV-2a spectrogram files found in %s. Run the download step first.", pdir)
+        sys.exit(1)
+    subject_ids = [int(p.stem.split("_")[1]) for p in spec_files]
+    log.info("Found %d BCI IV-2a subjects.", len(subject_ids))
+
+    # ── Load all spectrogram data ──────────────────────────────────────────
+    subject_spec_data: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for sid in subject_ids:
+        try:
+            imgs, y = load_subject_spectrograms("bci_iv2a", sid, data_dir=processed_dir)
+            subject_spec_data[sid] = (imgs, y)
+            log.info("  Subject %d: spectrograms=%s", sid, imgs.shape)
+        except Exception as e:
+            log.warning("  Subject %d skipped: %s", sid, e)
+
+    if not subject_spec_data:
+        log.error("No data loaded. Exiting.")
+        sys.exit(1)
+
+    if not checkpoint_path.exists():
+        log.error("PhysioNet checkpoint not found at %s. Run pretraining first.", checkpoint_path)
+        sys.exit(1)
+    log.info("Loaded %d subjects, checkpoint=%s", len(subject_spec_data), checkpoint_path)
+
+    for strategy in args.strategies:
+        if strategy == "within_subject":
+            log.info("Running ViT-only within-subject %d-fold CV...", args.n_folds)
+        else:
+            log.info("Running ViT-only LOSO CV...")
+        run_vit_cv(
+            strategy=strategy,
+            subject_spec_data=subject_spec_data,
+            spec_mean=spec_mean,
+            spec_std=spec_std,
+            checkpoint_path=checkpoint_path,
+            run_dir=run_dir,
+            n_folds=args.n_folds,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            device=str(device),
+            seed=args.seed,
+            log=log,
+            num_workers=args.num_workers,
+            prefetch_factor=args.prefetch_factor,
+            persistent_workers=args.persistent_workers,
+            use_amp=args.amp,
+            compile_model=args.compile,
+            accumulation_steps=args.accumulation_steps,
+            use_mixup=not args.no_mixup,
+            use_spec_augment=not args.no_spec_augment,
+            mixup_alpha=args.mixup_alpha,
+            mixup_prob=args.mixup_prob,
+            freq_mask_max_width=args.freq_mask_max_width,
+            time_mask_max_width=args.time_mask_max_width,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            warmup_epochs=args.warmup_epochs,
+            patience=args.patience,
+            label_smoothing=args.label_smoothing,
+            backbone_lr_scale=args.backbone_lr_scale,
+            layer_lr_decay=args.layer_lr_decay,
+            val_fraction=args.val_fraction,
+            vit_drop_rate=args.vit_drop_rate,
+            unfreeze_last_n=args.unfreeze_last_n,
+            force=args.force,
+        )
+
+    log.info("ViT baseline complete.")
+
+
+if __name__ == "__main__":
+    main()

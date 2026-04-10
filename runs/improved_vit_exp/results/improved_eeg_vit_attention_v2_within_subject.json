@@ -1,0 +1,30 @@
+{
+  "model": "ImprovedEEGViT+CSP+Riemann",
+  "vit_variant": "tiny",
+  "fusion": "attention_v2",
+  "strategy": "within_subject",
+  "mean_accuracy": 58.98568259729784,
+  "std_accuracy": 10.834180479291023,
+  "mean_kappa": 0.17843419595559998,
+  "mean_f1": 0.5071254650311671,
+  "n_folds": 45,
+  "per_subject": {
+    "1": 57.30792498487599,
+    "2": 52.79491833030853,
+    "3": 58.306110102843306,
+    "4": 50.70175438596491,
+    "5": 61.08287961282516,
+    "6": 52.09921355111918,
+    "7": 58.31215970961888,
+    "8": 74.67634603750756,
+    "9": 65.58983666061707
+  },
+  "config": {
+    "epochs": 100,
+    "batch_size": 32,
+    "lr": 0.0003,
+    "warmup_epochs": 10,
+    "use_mixup": true,
+    "use_spec_augment": true
+  }
+}
