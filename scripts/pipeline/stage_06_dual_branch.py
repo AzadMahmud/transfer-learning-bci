@@ -82,6 +82,7 @@ def _build_model(
     import torch
 
     from bci.models.dual_branch import DualBranchModel
+    from bci.models.vit_branch import load_backbone_checkpoint
     from bci.utils.config import ModelConfig
 
     use_imagenet = condition in ("imagenet", "transfer")
@@ -105,13 +106,12 @@ def _build_model(
             raise FileNotFoundError(
                 f"Transfer condition requires a valid checkpoint; got: {checkpoint_path}"
             )
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        backbone_state = {
-            k: v
-            for k, v in ckpt.items()
-            if not (k.startswith("head") or k.startswith("classifier"))
-        }
-        model.vit_branch.backbone.load_state_dict(backbone_state, strict=False)
+        load_backbone_checkpoint(
+            model.vit_branch.backbone,
+            checkpoint_path,
+            min_match_ratio=0.95,
+            strict_min_match=True,
+        )
 
     if condition in ("imagenet", "transfer"):
         model.freeze_vit_backbone(unfreeze_last_n_blocks=unfreeze_last_n)
@@ -344,6 +344,12 @@ def parse_args() -> argparse.Namespace:
         default=["within_subject", "loso"],
         choices=["within_subject", "loso"],
     )
+    p.add_argument(
+        "--unfreeze-last-n",
+        type=int,
+        default=4,
+        help="Keep last N ViT blocks trainable after loading pretrained weights",
+    )
     return p.parse_args()
 
 
@@ -354,8 +360,6 @@ def run_dual_branch(
     bshort: str,
     subject_data: dict,
     subject_spec_data: dict,
-    spec_mean,
-    spec_std,
     checkpoint_path: Path,
     run_dir: Path,
     n_folds: int,
@@ -372,6 +376,7 @@ def run_dual_branch(
     accumulation_steps: int,
     use_mixup: bool,
     use_spec_augment: bool,
+    unfreeze_last_n: int,
 ) -> Path:
     """Run dual-branch CV for one (fusion, strategy) pair and save results."""
     import numpy as np
@@ -380,6 +385,7 @@ def run_dual_branch(
 
     from bci.data.dual_branch_builder import DualBranchFoldBuilder
     from bci.models.dual_branch import DualBranchModel
+    from bci.models.vit_branch import load_backbone_checkpoint
     from bci.training.cross_validation import CVResult, FoldResult
     from bci.training.evaluation import compute_metrics
     from bci.training.splits import get_or_create_splits
@@ -427,27 +433,22 @@ def run_dual_branch(
         )
         model = DualBranchModel(math_input_dim=math_input_dim, config=cfg, img_size=TARGET_IMG_SIZE)
         if checkpoint_path.exists():
-            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-            backbone_state = {
-                k: v
-                for k, v in ckpt.items()
-                if not (k.startswith("head") or k.startswith("classifier"))
-            }
-            model.vit_branch.backbone.load_state_dict(backbone_state, strict=False)
+            load_backbone_checkpoint(
+                model.vit_branch.backbone,
+                checkpoint_path,
+                min_match_ratio=0.95,
+                strict_min_match=True,
+            )
         else:
             log.warning("Checkpoint not found at %s; using ImageNet init only.", checkpoint_path)
-        model.freeze_vit_backbone(unfreeze_last_n_blocks=2)
+        model.freeze_vit_backbone(unfreeze_last_n_blocks=unfreeze_last_n)
         return model
 
-    def normalise_specs(imgs: np.ndarray) -> np.ndarray:
-        # Resize from on-disk 224×224 to TARGET_IMG_SIZE×TARGET_IMG_SIZE
-        if imgs.shape[-1] != TARGET_IMG_SIZE:
-            t = torch.from_numpy(imgs.astype(np.float32))
-            t = torch.nn.functional.interpolate(
-                t, size=(TARGET_IMG_SIZE, TARGET_IMG_SIZE), mode="bilinear", align_corners=False
-            )
-            imgs = t.numpy()
-        return (imgs - spec_mean[None, :, None, None]) / spec_std[None, :, None, None]
+    def compute_channel_stats(imgs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        mean = imgs.mean(axis=(0, 2, 3), dtype=np.float64).astype(np.float32)
+        std = imgs.std(axis=(0, 2, 3), dtype=np.float64).astype(np.float32)
+        std = np.maximum(std, 1e-6)
+        return mean, std
 
     def feature_cache_path(subject_id: int, fold_idx: int, tag: str) -> Path:
         return (
@@ -487,8 +488,28 @@ def run_dual_branch(
                     cache_path=feature_cache_path(sid, fold_idx, "within"),
                 )
                 # Replace image tensors with cached normalised spectrograms
-                spec_train = normalise_specs(spec_imgs[train_idx]).astype(np.float32)
-                spec_test = normalise_specs(spec_imgs[test_idx]).astype(np.float32)
+                spec_train_raw = spec_imgs[train_idx].astype(np.float32)
+                spec_test_raw = spec_imgs[test_idx].astype(np.float32)
+                fold_mean, fold_std = compute_channel_stats(spec_train_raw)
+                spec_train = (spec_train_raw - fold_mean[None, :, None, None]) / fold_std[
+                    None, :, None, None
+                ]
+                spec_test = (spec_test_raw - fold_mean[None, :, None, None]) / fold_std[
+                    None, :, None, None
+                ]
+                if spec_train.shape[-1] != TARGET_IMG_SIZE:
+                    spec_train = torch.nn.functional.interpolate(
+                        torch.from_numpy(spec_train),
+                        size=(TARGET_IMG_SIZE, TARGET_IMG_SIZE),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).numpy()
+                    spec_test = torch.nn.functional.interpolate(
+                        torch.from_numpy(spec_test),
+                        size=(TARGET_IMG_SIZE, TARGET_IMG_SIZE),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).numpy()
                 train_ds = TensorDataset(
                     torch.from_numpy(spec_train),
                     torch.from_numpy(features_train),
@@ -515,25 +536,25 @@ def run_dual_branch(
                 )
                 rng = np.random.default_rng(seed + fold_counter)
 
-                def fwd(batch, _m=model):
+                def fwd(batch):
                     imgs, feats, labels = batch
                     imgs = imgs.to(_device, non_blocking=True)
                     feats = feats.to(_device, non_blocking=True)
                     labels = labels.to(_device, non_blocking=True)
-                    if _m.training and use_spec_augment:
+                    if model.training and use_spec_augment:
                         imgs_np = imgs.detach().cpu().numpy()
                         imgs = torch.from_numpy(aug(imgs_np, training=True)).to(
                             _device, non_blocking=True
                         )
-                    if _m.training and use_mixup and imgs.shape[0] > 1 and rng.random() < 0.5:
+                    if model.training and use_mixup and imgs.shape[0] > 1 and rng.random() < 0.5:
                         lam = float(rng.beta(0.4, 0.4))
                         perm = torch.randperm(imgs.shape[0], device=_device)
                         imgs_m = lam * imgs + (1.0 - lam) * imgs[perm]
                         feats_m = lam * feats + (1.0 - lam) * feats[perm]
-                        logits = _m(imgs_m, feats_m)
+                        logits = model(imgs_m, feats_m)
                         return logits, (labels, labels[perm], lam)
                     return (
-                        _m(imgs, feats),
+                        model(imgs, feats),
                         labels,
                     )
 
@@ -613,8 +634,28 @@ def run_dual_branch(
                 y_test,
                 cache_path=feature_cache_path(test_sid, fold_idx, "loso"),
             )
-            spec_train_n = normalise_specs(spec_train).astype(np.float32)
-            spec_test_n = normalise_specs(spec_test).astype(np.float32)
+            spec_train_raw = spec_train.astype(np.float32)
+            spec_test_raw = spec_test.astype(np.float32)
+            fold_mean, fold_std = compute_channel_stats(spec_train_raw)
+            spec_train_n = (spec_train_raw - fold_mean[None, :, None, None]) / fold_std[
+                None, :, None, None
+            ]
+            spec_test_n = (spec_test_raw - fold_mean[None, :, None, None]) / fold_std[
+                None, :, None, None
+            ]
+            if spec_train_n.shape[-1] != TARGET_IMG_SIZE:
+                spec_train_n = torch.nn.functional.interpolate(
+                    torch.from_numpy(spec_train_n),
+                    size=(TARGET_IMG_SIZE, TARGET_IMG_SIZE),
+                    mode="bilinear",
+                    align_corners=False,
+                ).numpy()
+                spec_test_n = torch.nn.functional.interpolate(
+                    torch.from_numpy(spec_test_n),
+                    size=(TARGET_IMG_SIZE, TARGET_IMG_SIZE),
+                    mode="bilinear",
+                    align_corners=False,
+                ).numpy()
             train_ds = TensorDataset(
                 torch.from_numpy(spec_train_n),
                 torch.from_numpy(features_train),
@@ -641,25 +682,25 @@ def run_dual_branch(
             )
             rng = np.random.default_rng(seed + fold_idx)
 
-            def fwd(batch, _m=model):
+            def fwd(batch):
                 imgs, feats, labels = batch
                 imgs = imgs.to(_device, non_blocking=True)
                 feats = feats.to(_device, non_blocking=True)
                 labels = labels.to(_device, non_blocking=True)
-                if _m.training and use_spec_augment:
+                if model.training and use_spec_augment:
                     imgs_np = imgs.detach().cpu().numpy()
                     imgs = torch.from_numpy(aug(imgs_np, training=True)).to(
                         _device, non_blocking=True
                     )
-                if _m.training and use_mixup and imgs.shape[0] > 1 and rng.random() < 0.5:
+                if model.training and use_mixup and imgs.shape[0] > 1 and rng.random() < 0.5:
                     lam = float(rng.beta(0.4, 0.4))
                     perm = torch.randperm(imgs.shape[0], device=_device)
                     imgs_m = lam * imgs + (1.0 - lam) * imgs[perm]
                     feats_m = lam * feats + (1.0 - lam) * feats[perm]
-                    logits = _m(imgs_m, feats_m)
+                    logits = model(imgs_m, feats_m)
                     return logits, (labels, labels[perm], lam)
                 return (
-                    _m(imgs, feats),
+                    model(imgs, feats),
                     labels,
                 )
 
@@ -835,7 +876,7 @@ def main() -> None:
     # ── Load spectrogram cache ─────────────────────────────────────────────
     log.info("Loading BCI IV-2a spectrogram cache...")
     try:
-        spec_mean, spec_std = load_spectrogram_stats("bci_iv2a", data_dir=processed_dir)
+        load_spectrogram_stats("bci_iv2a", data_dir=processed_dir)
     except FileNotFoundError as e:
         log.error("%s  Run the download step first.", e)
         sys.exit(1)
@@ -877,8 +918,6 @@ def main() -> None:
                 bshort=str(bshort),
                 subject_data=subject_data,
                 subject_spec_data=subject_spec_data,
-                spec_mean=spec_mean,
-                spec_std=spec_std,
                 checkpoint_path=checkpoint_path,
                 run_dir=run_dir,
                 n_folds=args.n_folds,
@@ -895,6 +934,7 @@ def main() -> None:
                 accumulation_steps=args.accumulation_steps,
                 use_mixup=not args.no_mixup,
                 use_spec_augment=not args.no_spec_augment,
+                unfreeze_last_n=args.unfreeze_last_n,
             )
 
     log.info("Dual-branch ablation complete.")

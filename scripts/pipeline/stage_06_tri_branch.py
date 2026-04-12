@@ -17,6 +17,7 @@ from bci.data.download import load_all_subjects, load_spectrogram_stats, load_su
 from bci.data.download import _processed_dir as _get_processed_dir
 from bci.data.dual_branch_builder import DualBranchFoldBuilder
 from bci.models.tri_branch import TriBranchAdaptiveModel
+from bci.models.vit_branch import load_backbone_checkpoint
 from bci.training.cross_validation import CVResult, FoldResult
 from bci.training.evaluation import compute_metrics
 from bci.training.splits import get_or_create_splits
@@ -37,6 +38,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--n-folds", type=int, default=5)
+    p.add_argument(
+        "--backbone",
+        default="eeg_vit_tiny_patch8_64",
+        help="ViT backbone name (currently supports eeg_vit_tiny_patch8_64)",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--prefetch-factor", type=int, default=2)
@@ -46,6 +52,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--accumulation-steps", type=int, default=1)
     p.add_argument("--no-mixup", action="store_true", help="Disable mixup")
     p.add_argument("--no-spec-augment", action="store_true", help="Disable SpecAugment")
+    p.add_argument("--entropy-reg", type=float, default=0.01)
+    p.add_argument("--label-smoothing", type=float, default=0.2)
+    p.add_argument("--mixup-alpha", type=float, default=0.4)
+    p.add_argument("--mixup-prob", type=float, default=0.5)
+    p.add_argument("--domain-adv-lambda", type=float, default=0.1)
+    p.add_argument("--domain-loss-weight", type=float, default=0.2)
+    p.add_argument(
+        "--curriculum",
+        action="store_true",
+        help="Subject-wise curriculum for LOSO (2 -> 4 -> all train subjects)",
+    )
     p.add_argument(
         "--checkpoint",
         default=None,
@@ -56,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=["within_subject", "loso"],
         choices=["within_subject", "loso"],
+    )
+    p.add_argument(
+        "--unfreeze-last-n",
+        type=int,
+        default=4,
+        help="Keep last N ViT blocks trainable after loading pretrained weights",
     )
     return p.parse_args()
 
@@ -119,7 +142,7 @@ def run_strategy(
 
     def build_model(math_input_dim: int) -> TriBranchAdaptiveModel:
         cfg = ModelConfig(
-            vit_model_name="eeg_vit_tiny_patch8_64",
+            vit_model_name=args.backbone,
             vit_pretrained=True,
             vit_drop_rate=0.1,
             in_chans=9,
@@ -130,18 +153,23 @@ def run_strategy(
             csp_dim=csp_dim,
             config=cfg,
             img_size=target_img_size,
+            vit_use_covariance_token=True,
+            n_subjects=len(subject_data),
+            grl_lambda=float(max(args.domain_adv_lambda, 0.0)),
         )
         if not checkpoint_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        backbone_state = {
-            k: v
-            for k, v in ckpt.items()
-            if not (k.startswith("head") or k.startswith("classifier"))
-        }
-        model.vit_branch.backbone.load_state_dict(backbone_state, strict=False)
-        model.freeze_vit_backbone(unfreeze_last_n_blocks=2)
+        load_backbone_checkpoint(
+            model.vit_branch.backbone,
+            checkpoint_path,
+            min_match_ratio=0.95,
+            strict_min_match=True,
+        )
+        model.freeze_vit_backbone(unfreeze_last_n_blocks=args.unfreeze_last_n)
         return model
+
+    subject_ids_sorted = sorted(subject_data.keys())
+    sid_to_idx = {sid: i for i, sid in enumerate(subject_ids_sorted)}
 
     def make_forward(model, seed_local: int):
         aug = SpectrogramAugmenter(
@@ -156,22 +184,44 @@ def run_strategy(
         )
         rng = np.random.default_rng(seed_local)
 
-        def fwd(batch, _m=model):
-            imgs, feats, labels = batch
+        def fwd(batch):
+            if len(batch) == 4:
+                imgs, feats, labels, subj = batch
+            else:
+                imgs, feats, labels = batch
+                subj = None
             imgs = imgs.to(_device, non_blocking=True)
             feats = feats.to(_device, non_blocking=True)
             labels = labels.to(_device, non_blocking=True)
-            if _m.training and not args.no_spec_augment:
+            subj_t = subj.to(_device, non_blocking=True) if subj is not None else None
+            if model.training and not args.no_spec_augment:
                 imgs_np = imgs.detach().cpu().numpy()
                 imgs = torch.from_numpy(aug(imgs_np, training=True)).to(_device, non_blocking=True)
-            if _m.training and not args.no_mixup and imgs.shape[0] > 1 and rng.random() < 0.5:
-                lam = float(rng.beta(0.4, 0.4))
+            if (
+                model.training
+                and not args.no_mixup
+                and imgs.shape[0] > 1
+                and rng.random() < args.mixup_prob
+            ):
+                lam = float(rng.beta(args.mixup_alpha, args.mixup_alpha))
                 perm = torch.randperm(imgs.shape[0], device=_device)
                 imgs = lam * imgs + (1.0 - lam) * imgs[perm]
                 feats = lam * feats + (1.0 - lam) * feats[perm]
-                logits = _m(imgs, feats)
-                return logits, (labels, labels[perm], lam)
-            return _m(imgs, feats), labels
+                logits, subj_logits = model.forward_with_subject(imgs, feats)
+                aux_loss = None
+                if subj_logits is not None and subj_t is not None:
+                    subj_mix = subj_t[perm]
+                    ce = torch.nn.CrossEntropyLoss()
+                    aux_loss = args.domain_loss_weight * (
+                        lam * ce(subj_logits, subj_t) + (1.0 - lam) * ce(subj_logits, subj_mix)
+                    )
+                return logits, (labels, labels[perm], lam), aux_loss
+            logits, subj_logits = model.forward_with_subject(imgs, feats)
+            aux_loss = None
+            if model.training and subj_logits is not None and subj_t is not None:
+                ce = torch.nn.CrossEntropyLoss()
+                aux_loss = args.domain_loss_weight * ce(subj_logits, subj_t)
+            return logits, labels, aux_loss
 
         return fwd
 
@@ -194,11 +244,13 @@ def run_strategy(
                     torch.from_numpy(normalise_specs(spec[train_idx]).astype(np.float32)),
                     torch.from_numpy(ft_tr),
                     torch.from_numpy(y[train_idx].astype(np.int64)),
+                    torch.full((len(train_idx),), sid_to_idx[sid], dtype=torch.int64),
                 )
                 te_ds = TensorDataset(
                     torch.from_numpy(normalise_specs(spec[test_idx]).astype(np.float32)),
                     torch.from_numpy(ft_te),
                     torch.from_numpy(y[test_idx].astype(np.int64)),
+                    torch.full((len(test_idx),), sid_to_idx[sid], dtype=torch.int64),
                 )
 
                 model = build_model(math_input_dim)
@@ -212,7 +264,7 @@ def run_strategy(
                     batch_size=args.batch_size,
                     warmup_epochs=10,
                     patience=20,
-                    label_smoothing=0.1,
+                    label_smoothing=args.label_smoothing,
                     val_fraction=0.2,
                     seed=args.seed,
                     num_workers=args.num_workers,
@@ -221,6 +273,7 @@ def run_strategy(
                     use_amp=args.amp,
                     compile_model=args.compile,
                     gradient_accumulation_steps=args.accumulation_steps,
+                    entropy_reg=args.entropy_reg,
                 )
                 trainer.fit(tr_ds, forward_fn=fwd, model_tag=f"tri_adapt_within_f{fold_counter}")
 
@@ -260,19 +313,35 @@ def run_strategy(
             spec_train = np.concatenate([subject_spec_data[s][0] for s in train_sids])
             spec_test, _ = subject_spec_data[test_sid]
 
+            subj_train = np.concatenate(
+                [
+                    np.full(subject_data[s][1].shape[0], sid_to_idx[s], dtype=np.int64)
+                    for s in train_sids
+                ]
+            )
+
             set_seed(args.seed + fold_idx)
             ft_tr, ft_te, math_input_dim = builder.build_math_features(
                 X_train, y_train, X_test, y_test, cache_path=None
             )
+
+            if args.curriculum and len(train_sids) >= 4:
+                ordered = train_sids[:]
+                stage_subject_sets = [ordered[:2], ordered[:4], ordered]
+            else:
+                stage_subject_sets = [train_sids]
+
             tr_ds = TensorDataset(
                 torch.from_numpy(normalise_specs(spec_train).astype(np.float32)),
                 torch.from_numpy(ft_tr),
                 torch.from_numpy(y_train.astype(np.int64)),
+                torch.from_numpy(subj_train.astype(np.int64)),
             )
             te_ds = TensorDataset(
                 torch.from_numpy(normalise_specs(spec_test).astype(np.float32)),
                 torch.from_numpy(ft_te),
                 torch.from_numpy(y_test.astype(np.int64)),
+                torch.full((len(y_test),), sid_to_idx[test_sid], dtype=torch.int64),
             )
 
             model = build_model(math_input_dim)
@@ -286,7 +355,7 @@ def run_strategy(
                 batch_size=args.batch_size,
                 warmup_epochs=10,
                 patience=20,
-                label_smoothing=0.1,
+                label_smoothing=args.label_smoothing,
                 val_fraction=0.2,
                 seed=args.seed,
                 num_workers=args.num_workers,
@@ -295,8 +364,25 @@ def run_strategy(
                 use_amp=args.amp,
                 compile_model=args.compile,
                 gradient_accumulation_steps=args.accumulation_steps,
+                entropy_reg=args.entropy_reg,
             )
-            trainer.fit(tr_ds, forward_fn=fwd, model_tag=f"tri_adapt_loso_f{fold_idx}")
+            if len(stage_subject_sets) == 1:
+                trainer.fit(tr_ds, forward_fn=fwd, model_tag=f"tri_adapt_loso_f{fold_idx}")
+            else:
+                all_imgs = normalise_specs(spec_train).astype(np.float32)
+                for stage_idx, sids_stage in enumerate(stage_subject_sets, start=1):
+                    mask = np.isin(subj_train, [sid_to_idx[s] for s in sids_stage])
+                    ds_stage = TensorDataset(
+                        torch.from_numpy(all_imgs[mask]),
+                        torch.from_numpy(ft_tr[mask]),
+                        torch.from_numpy(y_train[mask].astype(np.int64)),
+                        torch.from_numpy(subj_train[mask].astype(np.int64)),
+                    )
+                    trainer.fit(
+                        ds_stage,
+                        forward_fn=fwd,
+                        model_tag=f"tri_adapt_loso_f{fold_idx}_stage{stage_idx}",
+                    )
 
             te_loader = DataLoader(
                 te_ds,
@@ -338,7 +424,7 @@ def run_strategy(
     if strategy == "within_subject":
         data = {
             "model": "TriBranchAdaptive-VIT+CSP+Riemann",
-            "backbone": "eeg_vit_tiny_patch8_64",
+            "backbone": args.backbone,
             "fusion": "adaptive",
             "strategy": "within_subject",
             "mean_accuracy": result.mean_accuracy,
@@ -351,7 +437,7 @@ def run_strategy(
     else:
         data = {
             "model": "TriBranchAdaptive-VIT+CSP+Riemann",
-            "backbone": "eeg_vit_tiny_patch8_64",
+            "backbone": args.backbone,
             "fusion": "adaptive",
             "strategy": "loso",
             "mean_accuracy": result.mean_accuracy,

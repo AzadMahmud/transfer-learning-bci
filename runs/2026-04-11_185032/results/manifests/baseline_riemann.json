@@ -1,0 +1,10 @@
+{
+  "stage": "baseline_riemann",
+  "outputs": {
+    "within_loso": "runs/2026-04-11_185032/results/real_baseline_b_riemannian.json"
+  },
+  "meta": {
+    "n_folds": 5,
+    "seed": 42
+  }
+}

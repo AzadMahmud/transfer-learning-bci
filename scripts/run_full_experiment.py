@@ -137,6 +137,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--backbone", default="eeg_vit_tiny_patch8_64", help="backbone name")
     p.add_argument(
+        "--unfreeze-last-n",
+        type=int,
+        default=4,
+        help="Keep last N ViT blocks trainable in transfer stages",
+    )
+    p.add_argument(
         "--n-repeats",
         type=int,
         default=3,
@@ -267,7 +273,7 @@ def main() -> None:
             + nn
             + cv
             + proc
-            + ["--checkpoint", checkpoint],
+            + ["--checkpoint", checkpoint, "--unfreeze-last-n", str(args.unfreeze_last_n)],
         ),
         (
             6,
@@ -279,7 +285,7 @@ def main() -> None:
             + nn
             + cv
             + proc
-            + ["--checkpoint", checkpoint],
+            + ["--checkpoint", checkpoint, "--unfreeze-last-n", str(args.unfreeze_last_n)],
         ),
         (
             7,
@@ -292,7 +298,7 @@ def main() -> None:
             + ["--n-repeats", str(args.n_repeats)]
             + ["--fractions"]
             + [str(f) for f in args.fractions]
-            + ["--checkpoint", checkpoint]
+            + ["--checkpoint", checkpoint, "--unfreeze-last-n", str(args.unfreeze_last_n)]
             + proc,
         ),
         (
@@ -312,6 +318,7 @@ def main() -> None:
     log.info("Repeats (S07) : %d", args.n_repeats)
     log.info("Seed          : %d", args.seed)
     log.info("Checkpoint    : %s", checkpoint)
+    log.info("Unfreeze N    : %d", args.unfreeze_last_n)
     log.info("")
     log.info("Stages to run:")
     for n, name, enabled, _ in plan:

@@ -45,6 +45,9 @@ class TriBranchAdaptiveModel(nn.Module):
         csp_dim: int,
         config: ModelConfig | None = None,
         img_size: int | None = None,
+        vit_use_covariance_token: bool = True,
+        n_subjects: int | None = None,
+        grl_lambda: float = 0.0,
     ) -> None:
         super().__init__()
         self.config = config or ModelConfig()
@@ -54,9 +57,13 @@ class TriBranchAdaptiveModel(nn.Module):
 
         self.csp_dim = csp_dim
         self.riemann_dim = math_input_dim - csp_dim
+        self.grl_lambda = float(grl_lambda)
 
         self.vit_branch = ViTBranch(
-            config=self.config, as_feature_extractor=True, img_size=img_size
+            config=self.config,
+            as_feature_extractor=True,
+            img_size=img_size,
+            use_covariance_token=vit_use_covariance_token,
         )
         self.vit_embed = nn.Sequential(
             nn.Linear(self.vit_branch.feature_dim, 64),
@@ -71,6 +78,17 @@ class TriBranchAdaptiveModel(nn.Module):
         self.vit_head = nn.Linear(64, n_classes)
         self.csp_head = nn.Linear(64, n_classes)
         self.riemann_head = nn.Linear(64, n_classes)
+
+        self.subject_head: nn.Module | None
+        if n_subjects is not None and n_subjects > 1:
+            self.subject_head = nn.Sequential(
+                nn.Linear(64, 64),
+                nn.GELU(),
+                nn.Dropout(0.2),
+                nn.Linear(64, int(n_subjects)),
+            )
+        else:
+            self.subject_head = None
 
         # Gating uses branch embeddings + confidence summary (max prob for each branch)
         self.gate = nn.Sequential(
@@ -118,5 +136,52 @@ class TriBranchAdaptiveModel(nn.Module):
         )
         return fused_logits
 
+    def forward_with_subject(
+        self, images: torch.Tensor, features: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        csp = features[:, : self.csp_dim]
+        riemann = features[:, self.csp_dim :]
+
+        vit_feat = self.vit_embed(self.vit_branch(images))
+        csp_feat = self.csp_branch(csp)
+        riem_feat = self.riemann_branch(riemann)
+
+        vit_logits = self.vit_head(vit_feat)
+        csp_logits = self.csp_head(csp_feat)
+        riem_logits = self.riemann_head(riem_feat)
+
+        with torch.no_grad():
+            vit_conf = vit_logits.softmax(dim=-1).amax(dim=-1, keepdim=True)
+            csp_conf = csp_logits.softmax(dim=-1).amax(dim=-1, keepdim=True)
+            riem_conf = riem_logits.softmax(dim=-1).amax(dim=-1, keepdim=True)
+
+        gate_in = torch.cat([vit_feat, csp_feat, riem_feat, vit_conf, csp_conf, riem_conf], dim=-1)
+        weights = self.gate(gate_in).softmax(dim=-1)
+        fused_logits = (
+            weights[:, 0:1] * vit_logits
+            + weights[:, 1:2] * csp_logits
+            + weights[:, 2:3] * riem_logits
+        )
+
+        subject_logits: torch.Tensor | None = None
+        if self.subject_head is not None:
+            if self.grl_lambda > 0.0:
+                rev_vit = _GradReverse.apply(vit_feat, self.grl_lambda)
+            else:
+                rev_vit = vit_feat
+            subject_logits = self.subject_head(rev_vit)
+        return fused_logits, subject_logits
+
     def freeze_vit_backbone(self, unfreeze_last_n_blocks: int = 2) -> None:
         self.vit_branch.freeze_backbone(unfreeze_last_n_blocks=unfreeze_last_n_blocks)
+
+
+class _GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, lambd: float) -> torch.Tensor:
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return -ctx.lambd * grad_output, None

@@ -28,6 +28,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from bci.models.temporal_encoder import TemporalEncoder
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -308,13 +310,25 @@ class EEGViT(nn.Module):
         attn_drop_rate: float = 0.0,
         channel_names: list[str] | None = None,
         use_cls_token: bool = True,
+        use_covariance_token: bool = False,
+        use_temporal_encoder: bool = False,
         as_feature_extractor: bool = False,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
         self.feature_dim = embed_dim  # For compatibility with existing code
         self.use_cls_token = use_cls_token
+        self.use_covariance_token = use_covariance_token
+        self.use_temporal_encoder = bool(use_temporal_encoder)
+        self.n_channels = int(n_channels)
         self.as_feature_extractor = as_feature_extractor
+
+        if self.use_temporal_encoder:
+            self.temporal_encoder = TemporalEncoder(in_height=n_channels * freq_bins)
+            self.temporal_to_spectrogram = nn.Linear(64, n_channels * freq_bins)
+        else:
+            self.temporal_encoder = None
+            self.temporal_to_spectrogram = None
 
         # Default channel names for motor cortex
         if channel_names is None:
@@ -338,11 +352,19 @@ class EEGViT(nn.Module):
         else:
             self.cls_token = None
 
-        # Positional embedding for the full sequence (including CLS token)
+        # Positional embedding for the full sequence (including optional tokens)
         n_patches = self.patch_embed.n_patches
-        seq_len = n_patches + 1 if use_cls_token else n_patches
+        seq_len = n_patches + (1 if use_cls_token else 0) + (1 if use_covariance_token else 0)
         self.pos_embed = nn.Parameter(torch.zeros(1, seq_len, embed_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        if use_covariance_token:
+            self.cov_proj = nn.Sequential(
+                nn.LayerNorm(self.n_channels * self.n_channels),
+                nn.Linear(self.n_channels * self.n_channels, embed_dim),
+            )
+        else:
+            self.cov_proj = None
 
         # Dropout after embedding
         self.pos_drop = nn.Dropout(drop_rate)
@@ -396,13 +418,39 @@ class EEGViT(nn.Module):
         """
         B = x.shape[0]
 
+        if self.use_temporal_encoder and self.temporal_encoder is not None:
+            x_tf = x.reshape(
+                B, 1, self.n_channels * self.patch_embed.freq_bins, self.patch_embed.time_steps
+            )
+            x_seq = self.temporal_encoder(x_tf)
+            x_seq = x_seq.transpose(1, 2)
+            x_spec = self.temporal_to_spectrogram(x_seq)
+            x = x_spec.transpose(1, 2).reshape(B, self.n_channels, self.patch_embed.freq_bins, -1)
+            if x.shape[-1] != self.patch_embed.time_steps:
+                x = F.interpolate(
+                    x,
+                    size=(self.patch_embed.freq_bins, self.patch_embed.time_steps),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
         # Patch embedding: (B, n_patches, embed_dim)
+        x_raw = x
         x = self.patch_embed(x)
 
         # Prepend CLS token if used
         if self.cls_token is not None:
             cls_tokens = self.cls_token.expand(B, -1, -1)
             x = torch.cat([cls_tokens, x], dim=1)
+
+        if self.use_covariance_token and self.cov_proj is not None:
+            x_flat = x_raw.flatten(start_dim=2)
+            x_centered = x_flat - x_flat.mean(dim=-1, keepdim=True)
+            denom = max(x_centered.shape[-1] - 1, 1)
+            cov = torch.bmm(x_centered, x_centered.transpose(1, 2)) / float(denom)
+            cov_vec = cov.flatten(start_dim=1)
+            cov_token = self.cov_proj(cov_vec).unsqueeze(1)
+            x = torch.cat([x, cov_token], dim=1)
 
         # Add positional embedding
         x = x + self.pos_embed

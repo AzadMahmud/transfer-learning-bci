@@ -24,9 +24,10 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, cohen_kappa_score
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, OneCycleLR
 from torch.utils.data import DataLoader, Dataset, random_split
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,10 @@ class Trainer:
         gradient_accumulation_steps: int = 1,
         backbone_lr_scale: float | None = None,
         layer_lr_decay: float | None = None,
+        class_weights: list[float] | torch.Tensor | None = None,
+        entropy_reg: float = 0.0,
+        scheduler_name: str = "cosine",
+        steps_per_epoch: int | None = None,
     ) -> None:
         self.model: nn.Module = model
         self.device = torch.device(device)
@@ -160,11 +165,21 @@ class Trainer:
         self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
         self.backbone_lr_scale = backbone_lr_scale
         self.layer_lr_decay = layer_lr_decay
+        self.entropy_reg = float(entropy_reg)
+        self.scheduler_name = str(scheduler_name)
+        self.steps_per_epoch_override = steps_per_epoch
         if self.compile_model and hasattr(torch, "compile"):
             compiled_model = torch.compile(self.model)
             self.model = typing.cast(nn.Module, compiled_model)
         self.model.to(self.device)
-        self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        weight_tensor: torch.Tensor | None = None
+        if class_weights is not None:
+            if isinstance(class_weights, torch.Tensor):
+                weight_tensor = class_weights.float().detach().clone()
+            else:
+                weight_tensor = torch.tensor(class_weights, dtype=torch.float32)
+            weight_tensor = weight_tensor.to(self.device)
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing, weight=weight_tensor)
         if self.use_amp:
             self.scaler: Optional[torch.cuda.amp.GradScaler] = torch.cuda.amp.GradScaler()
         else:
@@ -177,10 +192,18 @@ class Trainer:
     ) -> torch.Tensor:
         if isinstance(labels, tuple):
             y_a, y_b, lam = labels
-            return lam * self.criterion(logits, y_a) + (1.0 - lam) * self.criterion(logits, y_b)
-        return self.criterion(logits, labels)
+            ce_loss = lam * self.criterion(logits, y_a) + (1.0 - lam) * self.criterion(logits, y_b)
+        else:
+            ce_loss = self.criterion(logits, labels)
 
-    def _make_optimizer_and_scheduler(self, total_epochs: int):
+        if self.entropy_reg <= 0.0:
+            return ce_loss
+
+        probs = F.softmax(logits, dim=-1)
+        entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=-1).mean()
+        return ce_loss - self.entropy_reg * entropy
+
+    def _make_optimizer_and_scheduler(self, total_epochs: int, steps_per_epoch: int):
         # --- Layer-wise LR decay (finest granularity) -----------------------
         if self.layer_lr_decay is not None and hasattr(self.model, "get_layerwise_param_groups"):
             param_groups = self._build_layerwise_param_groups(self.lr, self.layer_lr_decay)
@@ -220,7 +243,17 @@ class Trainer:
             param_groups,
             weight_decay=self.weight_decay,
         )
-        scheduler = _cosine_with_warmup_schedule(optimizer, self.warmup_epochs, total_epochs)
+        if self.scheduler_name == "onecycle":
+            scheduler = OneCycleLR(
+                optimizer,
+                max_lr=[pg["lr"] for pg in optimizer.param_groups],
+                epochs=total_epochs,
+                steps_per_epoch=max(1, self.steps_per_epoch_override or steps_per_epoch),
+                pct_start=max(0.01, min(0.5, self.warmup_epochs / max(total_epochs, 1))),
+                anneal_strategy="cos",
+            )
+        else:
+            scheduler = _cosine_with_warmup_schedule(optimizer, self.warmup_epochs, total_epochs)
         return optimizer, scheduler
 
     def _build_layerwise_param_groups(
@@ -293,9 +326,13 @@ class Trainer:
         loader: DataLoader,
         optimizer: torch.optim.Optimizer,
         forward_fn: Callable,
+        scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     ) -> float:
         """Run one training epoch and return mean loss."""
         self.model.train()
+        orig_mod = getattr(self.model, "_orig_mod", None)
+        if isinstance(orig_mod, nn.Module):
+            orig_mod.train()
         total_loss = 0.0
         n = 0
         n_batches = len(loader)
@@ -307,15 +344,29 @@ class Trainer:
             last_batch_idx = batch_idx
             if self.use_amp:
                 with torch.cuda.amp.autocast():
-                    logits, labels = forward_fn(batch)
+                    out = forward_fn(batch)
+                    if isinstance(out, tuple) and len(out) == 3:
+                        logits, labels, aux_loss = out
+                    else:
+                        logits, labels = out
+                        aux_loss = None
                     loss = self._compute_loss(logits, labels)
+                    if aux_loss is not None:
+                        loss = loss + aux_loss
                 unscaled_loss = loss
                 loss = loss / self.gradient_accumulation_steps
                 assert self.scaler is not None
                 self.scaler.scale(loss).backward()
             else:
-                logits, labels = forward_fn(batch)
+                out = forward_fn(batch)
+                if isinstance(out, tuple) and len(out) == 3:
+                    logits, labels, aux_loss = out
+                else:
+                    logits, labels = out
+                    aux_loss = None
                 loss = self._compute_loss(logits, labels)
+                if aux_loss is not None:
+                    loss = loss + aux_loss
                 unscaled_loss = loss
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
@@ -331,6 +382,8 @@ class Trainer:
                     self.scaler.update()
                 else:
                     optimizer.step()
+                if scheduler is not None and self.scheduler_name == "onecycle":
+                    scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             batch_size = logits.shape[0]
@@ -356,6 +409,8 @@ class Trainer:
                 self.scaler.update()
             else:
                 optimizer.step()
+            if scheduler is not None and self.scheduler_name == "onecycle":
+                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
         return total_loss / max(n, 1)
 
@@ -371,6 +426,9 @@ class Trainer:
             (loss, accuracy_percent, kappa)
         """
         self.model.eval()
+        orig_mod = getattr(self.model, "_orig_mod", None)
+        if isinstance(orig_mod, nn.Module):
+            orig_mod.eval()
         total_loss = 0.0
         n = 0
         all_preds: list[np.ndarray] = []
@@ -382,10 +440,18 @@ class Trainer:
         for batch_idx, batch in enumerate(loader, start=1):
             if self.use_amp:
                 with torch.cuda.amp.autocast():
-                    logits, labels = forward_fn(batch)
+                    out = forward_fn(batch)
+                    if isinstance(out, tuple) and len(out) == 3:
+                        logits, labels, _ = out
+                    else:
+                        logits, labels = out
                     loss = self.criterion(logits, labels)
             else:
-                logits, labels = forward_fn(batch)
+                out = forward_fn(batch)
+                if isinstance(out, tuple) and len(out) == 3:
+                    logits, labels, _ = out
+                else:
+                    logits, labels = out
                 loss = self.criterion(logits, labels)
             total_loss += loss.item() * len(labels)
             n += len(labels)
@@ -468,7 +534,9 @@ class Trainer:
             )
         else:
             train_loader, val_loader = self._split_dataset(dataset)
-        optimizer, scheduler = self._make_optimizer_and_scheduler(self.epochs)
+        optimizer, scheduler = self._make_optimizer_and_scheduler(
+            self.epochs, steps_per_epoch=len(train_loader)
+        )
 
         best_val_acc = 0.0
         best_epoch = 0
@@ -497,10 +565,11 @@ class Trainer:
         t_start = time.time()
         for epoch in range(1, self.epochs + 1):
             logger.info("  Epoch %d/%d: loading first batch...", epoch, self.epochs)
-            train_loss = self._train_one_epoch(train_loader, optimizer, forward_fn)
+            train_loss = self._train_one_epoch(train_loader, optimizer, forward_fn, scheduler)
             val_loss, val_acc, val_kappa = self._evaluate(val_loader, forward_fn)
             current_lr = optimizer.param_groups[0]["lr"]
-            scheduler.step()
+            if self.scheduler_name != "onecycle":
+                scheduler.step()
 
             result = EpochResult(
                 epoch=epoch,
@@ -595,11 +664,18 @@ class Trainer:
             forward_fn = default_forward_fn
 
         self.model.eval()
+        orig_mod = getattr(self.model, "_orig_mod", None)
+        if isinstance(orig_mod, nn.Module):
+            orig_mod.eval()
         all_probs: list[np.ndarray] = []
         all_preds: list[np.ndarray] = []
 
         for batch in loader:
-            logits, _ = forward_fn(batch)
+            out = forward_fn(batch)
+            if isinstance(out, tuple) and len(out) == 3:
+                logits, _, _ = out
+            else:
+                logits, _ = out
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
             preds = logits.argmax(dim=-1).cpu().numpy()
             all_probs.append(probs)

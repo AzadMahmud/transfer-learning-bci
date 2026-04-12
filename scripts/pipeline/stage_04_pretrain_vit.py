@@ -443,7 +443,7 @@ def parse_args() -> argparse.Namespace:
     )
     # LP-FT hyperparameters
     p.add_argument(
-        "--lp-epochs", type=int, default=5, help="Linear-probe phase epochs (0 to skip LP-FT)"
+        "--lp-epochs", type=int, default=0, help="Linear-probe phase epochs (0 to skip LP-FT)"
     )
     p.add_argument(
         "--lp-lr", type=float, default=1e-3, help="Learning rate for the linear-probe phase"
@@ -451,7 +451,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--ft-lr", type=float, default=3e-5, help="Base learning rate for the fine-tune phase"
     )
-    p.add_argument("--ft-epochs", type=int, default=45, help="Fine-tune phase epochs")
+    p.add_argument("--ft-epochs", type=int, default=50, help="Fine-tune phase epochs")
     p.add_argument(
         "--ft-warmup-epochs", type=int, default=3, help="Warmup epochs for the fine-tune phase"
     )
@@ -737,7 +737,15 @@ def main() -> None:
         in_chans=9,
         n_classes=2,
     )
-    model = ViTBranch(config=model_config, as_feature_extractor=False, img_size=TARGET_IMG_SIZE)
+    model = ViTBranch(
+        config=model_config,
+        as_feature_extractor=False,
+        img_size=TARGET_IMG_SIZE,
+        embed_dim=192,
+        depth=4,
+        num_heads=3,
+        use_covariance_token=False,
+    )
 
     aug = SpectrogramAugmenter(
         AugmentationConfig(
@@ -778,20 +786,20 @@ def main() -> None:
             len(unexpected),
         )
 
-    def fwd(batch, _m=model):
+    def fwd(batch):
         imgs, labels = batch
         imgs = imgs.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        if _m.training and not args.no_spec_augment:
+        if model.training and not args.no_spec_augment:
             imgs_np = imgs.detach().cpu().numpy()
             imgs = torch.from_numpy(aug(imgs_np, training=True)).to(device, non_blocking=True)
-        if _m.training and not args.no_mixup and imgs.shape[0] > 1 and rng_mix.random() < 0.5:
+        if model.training and not args.no_mixup and imgs.shape[0] > 1 and rng_mix.random() < 0.5:
             lam = float(rng_mix.beta(0.4, 0.4))
             perm = torch.randperm(imgs.shape[0], device=device)
             imgs_mix = lam * imgs + (1.0 - lam) * imgs[perm]
-            logits = _m(imgs_mix)
+            logits = model(imgs_mix)
             return logits, (labels, labels[perm], lam)
-        return _m(imgs), labels
+        return model(imgs), labels
 
     t0 = time.time()
     use_lpft = args.lp_epochs > 0

@@ -1,0 +1,12 @@
+{
+  "baseline_csp": {
+    "outputs": {
+      "within_loso": "runs/2026-04-12_overnight_rerun/results/real_baseline_a_csp_lda.json"
+    }
+  },
+  "baseline_riemann": {
+    "outputs": {
+      "within_loso": "runs/2026-04-12_overnight_rerun/results/real_baseline_b_riemannian.json"
+    }
+  }
+}

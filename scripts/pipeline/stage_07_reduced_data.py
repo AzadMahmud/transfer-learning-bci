@@ -253,6 +253,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--force", action="store_true", help="Overwrite existing outputs")
     p.add_argument("--no-mixup", action="store_true", help="Disable mixup")
     p.add_argument("--no-spec-augment", action="store_true", help="Disable SpecAugment")
+    p.add_argument(
+        "--unfreeze-last-n",
+        type=int,
+        default=4,
+        help="Keep last N ViT blocks trainable after loading pretrained weights",
+    )
     return p.parse_args()
 
 
@@ -350,6 +356,7 @@ def main() -> None:
     from bci.data.download import _processed_dir as _get_processed_dir
     from bci.data.dual_branch_builder import DualBranchFoldBuilder
     from bci.models.dual_branch import DualBranchModel
+    from bci.models.vit_branch import load_backbone_checkpoint
     from bci.training.evaluation import compute_metrics
     from bci.training.splits import get_or_create_splits
     from bci.training.trainer import Trainer
@@ -443,19 +450,18 @@ def main() -> None:
         )
         model = DualBranchModel(math_input_dim=math_input_dim, config=cfg, img_size=TARGET_IMG_SIZE)
         if checkpoint_path.exists():
-            ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-            backbone_state = {
-                k: v
-                for k, v in ckpt.items()
-                if not (k.startswith("head") or k.startswith("classifier"))
-            }
-            model.vit_branch.backbone.load_state_dict(backbone_state, strict=False)
+            load_backbone_checkpoint(
+                model.vit_branch.backbone,
+                checkpoint_path,
+                min_match_ratio=0.95,
+                strict_min_match=True,
+            )
         else:
             log.warning(
                 "Checkpoint not found at %s; transfer condition uses ImageNet init only.",
                 checkpoint_path,
             )
-        model.freeze_vit_backbone(unfreeze_last_n_blocks=2)
+        model.freeze_vit_backbone(unfreeze_last_n_blocks=args.unfreeze_last_n)
         return model
 
     results: dict[str, dict] = {"transfer": {}}
@@ -534,18 +540,18 @@ def main() -> None:
                         )
                         rng = np.random.default_rng(trial_seed)
 
-                        def fwd(batch, _m=model):
+                        def fwd(batch):
                             imgs, feats, labels = batch
                             imgs = imgs.to(_device, non_blocking=True)
                             feats = feats.to(_device, non_blocking=True)
                             labels = labels.to(_device, non_blocking=True)
-                            if _m.training and not args.no_spec_augment:
+                            if model.training and not args.no_spec_augment:
                                 imgs_np = imgs.detach().cpu().numpy()
                                 imgs = torch.from_numpy(aug(imgs_np, training=True)).to(
                                     _device, non_blocking=True
                                 )
                             if (
-                                _m.training
+                                model.training
                                 and not args.no_mixup
                                 and imgs.shape[0] > 1
                                 and rng.random() < 0.5
@@ -553,10 +559,10 @@ def main() -> None:
                                 lam = float(rng.beta(0.4, 0.4))
                                 perm = torch.randperm(imgs.shape[0], device=_device)
                                 imgs_mix = lam * imgs + (1.0 - lam) * imgs[perm]
-                                logits = _m(imgs_mix, feats)
+                                logits = model(imgs_mix, feats)
                                 return logits, (labels, labels[perm], lam)
                             return (
-                                _m(imgs, feats),
+                                model(imgs, feats),
                                 labels,
                             )
 

@@ -76,6 +76,7 @@
 #   --amp             enable mixed precision (CUDA only)
 #   --compile         enable torch.compile (PyTorch 2.0+)
 #   --accumulation-steps N  gradient accumulation steps (default: 1)
+#   --unfreeze-last-n N  keep last N ViT blocks trainable (default: 4)
 #
 # Set RUN_DIR env variable to reuse an existing directory, e.g.:
 #   RUN_DIR=runs/2024-01-15_143022 bash scripts/run_all.sh
@@ -113,6 +114,7 @@ PERSISTENT_WORKERS=false
 AMP=false
 COMPILE=false
 ACCUMULATION_STEPS=1
+UNFREEZE_LAST_N=4
 
 # ── Parse flags ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -129,6 +131,7 @@ while [[ $# -gt 0 ]]; do
         --amp) AMP=true; shift 1 ;;
         --compile) COMPILE=true; shift 1 ;;
         --accumulation-steps) ACCUMULATION_STEPS="$2"; shift 2 ;;
+        --unfreeze-last-n) UNFREEZE_LAST_N="$2"; shift 2 ;;
         *)
             echo "Unknown option: $1" >&2
             echo "Run: bash scripts/run_all.sh  (with no args) to see usage in the header." >&2
@@ -188,6 +191,7 @@ _log "Persistent    : $PERSISTENT_WORKERS"
 _log "AMP           : $AMP"
 _log "Compile       : $COMPILE"
 _log "Accum steps   : $ACCUMULATION_STEPS"
+_log "Unfreeze N    : $UNFREEZE_LAST_N"
 _log ""
 
 T_ALL=$(date +%s)
@@ -252,6 +256,7 @@ uv run python scripts/pipeline/stage_05_vit_baseline.py \
     $PERSISTENT_FLAG \
     $AMP_FLAG $COMPILE_FLAG --accumulation-steps "$ACCUMULATION_STEPS" \
     --n-folds "$N_FOLDS" \
+    --unfreeze-last-n "$UNFREEZE_LAST_N" \
     2>&1 | tee -a "$LOG"
 _log "Stage 5 done in $(( $(date +%s) - T0 ))s"
 
@@ -268,6 +273,7 @@ uv run python scripts/pipeline/stage_06_dual_branch.py \
     $PERSISTENT_FLAG \
     $AMP_FLAG $COMPILE_FLAG --accumulation-steps "$ACCUMULATION_STEPS" \
     --n-folds "$N_FOLDS" \
+    --unfreeze-last-n "$UNFREEZE_LAST_N" \
     2>&1 | tee -a "$LOG"
 _log "Stage 6 done in $(( $(date +%s) - T0 ))s"
 
@@ -284,6 +290,7 @@ uv run python scripts/pipeline/stage_07_reduced_data.py \
     $PERSISTENT_FLAG \
     $AMP_FLAG $COMPILE_FLAG --accumulation-steps "$ACCUMULATION_STEPS" \
     --n-repeats "$N_REPEATS" \
+    --unfreeze-last-n "$UNFREEZE_LAST_N" \
     2>&1 | tee -a "$LOG"
 _log "Stage 7 done in $(( $(date +%s) - T0 ))s"
 
