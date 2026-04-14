@@ -1,0 +1,44 @@
+{
+  "backbone": "eeg_vit_tiny_patch8_64",
+  "fractions": [
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1.0
+  ],
+  "results": {
+    "transfer": {
+      "0.10": {
+        "fraction_pct": 10,
+        "mean_accuracy": 52.0817,
+        "std_accuracy": 6.7688,
+        "n_runs": 135
+      },
+      "0.25": {
+        "fraction_pct": 25,
+        "mean_accuracy": 54.3013,
+        "std_accuracy": 7.0975,
+        "n_runs": 135
+      },
+      "0.50": {
+        "fraction_pct": 50,
+        "mean_accuracy": 57.5882,
+        "std_accuracy": 8.1725,
+        "n_runs": 135
+      },
+      "0.75": {
+        "fraction_pct": 75,
+        "mean_accuracy": 61.0428,
+        "std_accuracy": 8.8092,
+        "n_runs": 135
+      },
+      "1.00": {
+        "fraction_pct": 100,
+        "mean_accuracy": 61.3448,
+        "std_accuracy": 9.7063,
+        "n_runs": 135
+      }
+    }
+  }
+}

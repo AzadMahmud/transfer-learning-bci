@@ -1,0 +1,10 @@
+{
+  "stage": "baseline_csp",
+  "outputs": {
+    "within_loso": "runs/2026-04-12_overnight_rerun_safe/results/real_baseline_a_csp_lda.json"
+  },
+  "meta": {
+    "n_folds": 5,
+    "seed": 42
+  }
+}

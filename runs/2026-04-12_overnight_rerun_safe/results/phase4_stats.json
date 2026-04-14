@@ -1,0 +1,82 @@
+{
+  "baseline_vs_dual": [
+    {
+      "comparison": "DualBranch(attention) vs CSP+LDA",
+      "n_subjects": 9,
+      "dual_mean": 56.40432098765432,
+      "baseline_mean": 65.77932098765433,
+      "mean_diff": -9.375000000000007,
+      "wilcoxon_stat": 7.0,
+      "wilcoxon_p": 0.07421875,
+      "t_stat": -2.2273433954229453,
+      "t_p": 0.056530791795590285,
+      "cohens_d": -1.0602284965107607,
+      "effect_size": "large"
+    },
+    {
+      "comparison": "DualBranch(attention) vs Riemannian+LDA",
+      "n_subjects": 9,
+      "dual_mean": 56.40432098765432,
+      "baseline_mean": 64.31327160493828,
+      "mean_diff": -7.908950617283956,
+      "wilcoxon_stat": 4.0,
+      "wilcoxon_p": 0.02734375,
+      "t_stat": -2.454297926838699,
+      "t_p": 0.03966993751657057,
+      "cohens_d": -0.9483654429723158,
+      "effect_size": "large"
+    },
+    {
+      "comparison": "DualBranch(attention) vs ViT-Only",
+      "n_subjects": 9,
+      "dual_mean": 56.40432098765432,
+      "baseline_mean": 56.94444444444444,
+      "mean_diff": -0.5401234567901199,
+      "wilcoxon_stat": 22.0,
+      "wilcoxon_p": 0.9921875,
+      "t_stat": -0.3950721740335561,
+      "t_p": 0.7031145251573421,
+      "cohens_d": -0.116425877713418,
+      "effect_size": "negligible"
+    }
+  ],
+  "transfer_conditions": [],
+  "fusion_methods": {
+    "test": "Friedman",
+    "statistic": 1.6363636363636365,
+    "p_value": 0.441233167759984,
+    "significant_at_0.05": false,
+    "per_method": {
+      "attention_v2": {
+        "mean": 57.13734567901234,
+        "std": 6.65707722241918,
+        "n": 9
+      },
+      "attention": {
+        "mean": 56.98302469135803,
+        "std": 6.474128692408343,
+        "n": 9
+      }
+    }
+  },
+  "per_subject_variance": {
+    "model": "DualBranch (attention)",
+    "n_subjects": 9,
+    "mean": 56.40432098765432,
+    "std": 4.866925290338921,
+    "min": 50.0,
+    "max": 64.23611111111111,
+    "range": 14.236111111111114,
+    "per_subject": {
+      "1": 63.19444444444444,
+      "2": 56.59722222222222,
+      "3": 53.125,
+      "4": 50.34722222222222,
+      "5": 50.0,
+      "6": 60.06944444444444,
+      "7": 55.208333333333336,
+      "8": 54.861111111111114,
+      "9": 64.23611111111111
+    }
+  }
+}
